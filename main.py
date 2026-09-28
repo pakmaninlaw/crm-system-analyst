@@ -518,11 +518,46 @@ LAYOUT = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}CRM аналитика{% endblock %}</title>
+    <script>try { document.documentElement.dataset.theme = new URLSearchParams(location.search).get('theme') || localStorage.getItem('sa-theme') || 'classic'; } catch (e) { document.documentElement.dataset.theme = 'classic'; }</script>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
     <style>
+        /* Темы оформления (общие с витриной портфолио): classic, graphite, bordeaux, violet */
+        :root, :root[data-theme="classic"] {
+            --page-bg: linear-gradient(135deg, #e9edf2 0%, #d9dfe7 100%);
+            --head-bg: linear-gradient(135deg, #1f2a44, #33486b);
+            --accent: #1f4e79; --accent-dark: #163a5a; --accent-soft: #d5dfea; --footer: #6c757d;
+        }
+        :root[data-theme="graphite"] {
+            --page-bg: linear-gradient(135deg, #3a3f47 0%, #23272d 100%);
+            --head-bg: linear-gradient(135deg, #343a40, #50575f);
+            --accent: #495057; --accent-dark: #343a40; --accent-soft: #dee2e6; --footer: rgba(255,255,255,.55);
+        }
+        :root[data-theme="bordeaux"] {
+            --page-bg: linear-gradient(135deg, #f0ebe7 0%, #e3d9d3 100%);
+            --head-bg: linear-gradient(135deg, #5a1a2b, #83344a);
+            --accent: #7a2a3e; --accent-dark: #5a1a2b; --accent-soft: #eddbe0; --footer: #7d6b6f;
+        }
+        :root[data-theme="violet"] {
+            --page-bg: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --head-bg: linear-gradient(135deg, #667eea, #764ba2);
+            --accent: #5a4fcf; --accent-dark: #4a3fbf; --accent-soft: #e3e0fb; --footer: rgba(255,255,255,.55);
+        }
+        .btn-primary { --bs-btn-bg: var(--accent); --bs-btn-border-color: var(--accent); --bs-btn-hover-bg: var(--accent-dark);
+            --bs-btn-hover-border-color: var(--accent-dark); --bs-btn-active-bg: var(--accent-dark); --bs-btn-active-border-color: var(--accent-dark); }
+        .btn-outline-primary { --bs-btn-color: var(--accent); --bs-btn-border-color: var(--accent); --bs-btn-hover-bg: var(--accent);
+            --bs-btn-hover-border-color: var(--accent); --bs-btn-active-bg: var(--accent); --bs-btn-active-border-color: var(--accent); }
+        .themes { display: flex; justify-content: center; gap: 8px; margin-top: 12px; }
+        .themes button { width: 20px; height: 20px; border-radius: 50%; border: 2px solid rgba(255,255,255,.35); padding: 0;
+            background: var(--sw); cursor: pointer; transition: transform .2s; }
+        .themes button:hover { transform: scale(1.2); }
+        .themes button[aria-pressed="true"] { border-color: #fff; }
+        .t-classic { --sw: linear-gradient(135deg, #1f3a5f 50%, #c9a86a 50%); }
+        .t-graphite { --sw: linear-gradient(135deg, #3a3f47 50%, #d9dde3 50%); }
+        .t-bordeaux { --sw: linear-gradient(135deg, #5a1a2b 50%, #d8b98a 50%); }
+        .t-violet { --sw: linear-gradient(135deg, #764ba2 50%, #4fd1c5 50%); }
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: var(--page-bg);
             min-height: 100vh;
             font-family: 'Segoe UI', Tahoma, sans-serif;
             padding: 20px 0;
@@ -535,7 +570,7 @@ LAYOUT = """
             margin-bottom: 20px;
         }
         .header-title {
-            background: linear-gradient(135deg, #667eea, #764ba2);
+            background: var(--head-bg);
             color: white;
             padding: 25px;
             border-radius: 15px;
@@ -544,15 +579,15 @@ LAYOUT = """
         }
         .header-title h1 { margin: 0; font-size: 2rem; }
         .header-title p { margin: 5px 0 0 0; opacity: 0.9; }
-        .nav-pills .nav-link { color: #5a4fcf; border: 1px solid #e3e0fb; }
-        .nav-pills .nav-link.active { background: linear-gradient(135deg, #667eea, #764ba2); border-color: transparent; }
+        .nav-pills .nav-link { color: var(--accent); border: 1px solid var(--accent-soft); }
+        .nav-pills .nav-link.active { background: var(--head-bg); border-color: transparent; }
 
         .stat-card {
             background: linear-gradient(135deg, #f5f7fa, #e8ecf3);
             border-radius: 12px;
             padding: 18px;
             text-align: center;
-            border-left: 5px solid #667eea;
+            border-left: 5px solid var(--accent);
             transition: transform 0.2s;
             height: 100%;
         }
@@ -583,7 +618,8 @@ LAYOUT = """
         .timer.running::before { content: "● "; color: #dc3545; animation: blink 1s infinite; }
         @keyframes blink { 50% { opacity: 0; } }
 
-        .table thead { background: linear-gradient(135deg, #667eea, #764ba2); color: white; }
+        .table thead { background: var(--head-bg); color: white; }
+        .table > thead { --bs-table-bg: transparent; --bs-table-color: #fff; }
         .table thead th { border: none; padding: 12px; font-weight: 600; white-space: nowrap; }
         .table td { vertical-align: middle; }
 
@@ -611,6 +647,12 @@ LAYOUT = """
         <div class="header-title">
             <h1><i class="bi bi-kanban"></i> CRM системного аналитика</h1>
             <p>Интервью → задачи → исполнители → KPI • Сегодня: {{ today_str }}</p>
+            <div class="themes" role="group" aria-label="Оформление">
+                <button class="t-classic" data-theme="classic" title="Классика"></button>
+                <button class="t-graphite" data-theme="graphite" title="Графит"></button>
+                <button class="t-bordeaux" data-theme="bordeaux" title="Бордо"></button>
+                <button class="t-violet" data-theme="violet" title="Фиолетовая"></button>
+            </div>
         </div>
         <ul class="nav nav-pills mb-4 gap-2 flex-wrap">
             <li class="nav-item"><a class="nav-link {% if active_tab == 'tasks' %}active{% endif %}" href="{{ root }}/"><i class="bi bi-list-task"></i> Задачи</a></li>
@@ -626,7 +668,7 @@ LAYOUT = """
         {% endif %}
         {% block content %}{% endblock %}
     </div>
-    <p class="text-center text-white-50 small">CRM системного аналитика v2.0 • данные: crm.db (SQLite)</p>
+    <p class="text-center small" style="color: var(--footer)">CRM системного аналитика v2.0 • данные: crm.db (SQLite)</p>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -661,6 +703,15 @@ LAYOUT = """
     }
 
     function reloadSoon() { setTimeout(() => location.reload(), 700); }
+
+    // Тема оформления: сохраняется в браузере, общая с витриной портфолио
+    function applyTheme(name) {
+        document.documentElement.dataset.theme = name;
+        document.querySelectorAll('.themes button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.theme === name)));
+        try { localStorage.setItem('sa-theme', name); } catch (e) {}
+    }
+    document.querySelectorAll('.themes button').forEach(b => b.addEventListener('click', () => applyTheme(b.dataset.theme)));
+    applyTheme(document.documentElement.dataset.theme || 'classic');
 
     async function resetDemo() {
         if (!confirm('Вернуть демо-данные к исходному состоянию?')) return;
