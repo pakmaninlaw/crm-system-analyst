@@ -933,7 +933,7 @@ INTERVIEWS = """
         </div>
     </div>
 
-    <label class="form-label">Протокол встречи</label>
+    <label class="form-label d-block">Протокол встречи</label>
     <textarea id="iText" class="form-control mb-2" rows="9" placeholder="Каждое требование — отдельным предложением или строкой: «Нужно…», «Должно…», «Хочу, чтобы…». Сроки можно указать прямо в тексте: «до 15.10», «через 2 недели», «срочно»."></textarea>
     <div class="d-flex flex-wrap gap-2">
         <button class="btn btn-primary" onclick="parseText()"><i class="bi bi-magic"></i> Разобрать на задачи</button>
