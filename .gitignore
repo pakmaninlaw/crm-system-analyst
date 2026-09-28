@@ -1,0 +1,9 @@
+# Рабочие данные — не публикуются
+*.db
+project_data.json
+original_main_07-09.py
+
+__pycache__/
+*.pyc
+.venv/
+.idea/
