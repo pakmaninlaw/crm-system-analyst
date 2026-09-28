@@ -7,6 +7,8 @@ import sys
 import tempfile
 
 os.environ["CRM_DEMO"] = "1"
+os.environ["CRM_LOG"] = os.path.join(tempfile.mkdtemp(), "test.log")
+os.environ["CRM_LOG_LEVEL"] = "DEBUG"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -16,6 +18,11 @@ except Exception:
 import main  # noqa: E402
 from flask import Flask  # noqa: E402
 from werkzeug.middleware.dispatcher import DispatcherMiddleware  # noqa: E402
+
+@main.app.route("/boom-test")
+def boom():
+    raise RuntimeError("проверочный сбой")
+
 
 main.DB_FILE = os.path.join(tempfile.mkdtemp(), "test.db")
 main.init_db()
@@ -93,6 +100,37 @@ def test_sick_employee_gets_no_tasks():
                        "priority": "средний", "deadline": "2030-01-01", "estimate_hours": 2})
     after = db.execute("SELECT COUNT(*) FROM tasks WHERE employee_id = ?", (sick,)).fetchone()[0]
     assert before == after
+
+
+def test_logging():
+    db = main.sqlite3.connect(main.DB_FILE)
+    db.row_factory = main.sqlite3.Row
+    before = db.execute("SELECT MAX(id) FROM events").fetchone()[0] or 0
+    post("/task/add", {"title": "Проверка журнала", "department": "Frontend", "employee_id": "auto",
+                       "priority": "низкий", "deadline": "2030-01-01", "estimate_hours": 1})
+    post("/task/add", {"title": "", "department": "Frontend"}, expect=False)
+    new = db.execute("SELECT level, action FROM events WHERE id > ? ORDER BY id", (before,)).fetchall()
+    assert [tuple(r) for r in new] == [("INFO", "Задача создана вручную"), ("WARNING", "Отказ")], [tuple(r) for r in new]
+    html = client.get("/crm/log?level=WARNING").get_data(as_text=True)
+    assert "Отказ" in html and "Задача создана вручную" not in html
+    csv_text = client.get("/crm/log.csv?q=журнала").get_data(as_text=True)
+    assert "Проверка журнала" in csv_text
+    with open(main.LOG_FILE, encoding="utf-8") as f:
+        text = f.read()
+    assert "INFO    | Задача создана вручную" in text and "WARNING | Отказ" in text and "DEBUG   | Разбор протокола" in text
+
+
+def test_error_is_logged():
+    r = client.get("/crm/boom-test")
+    assert r.status_code == 500
+    db = main.sqlite3.connect(main.DB_FILE)
+    assert db.execute("SELECT COUNT(*) FROM events WHERE level = 'ERROR' AND message LIKE '%проверочный сбой%'").fetchone()[0] == 1
+    with open(main.LOG_FILE, encoding="utf-8") as f:
+        assert "Traceback" in f.read()
+
+
+def test_back_to_projects_button():
+    assert 'class="back-home" href="/"' in client.get("/crm/kpi").get_data(as_text=True)
 
 
 def test_demo_limits_and_daily_reset():

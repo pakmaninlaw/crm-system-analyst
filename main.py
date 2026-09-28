@@ -14,17 +14,22 @@ CRM системного аналитика — версия 2.0
 
 Запуск: python main.py  ->  http://127.0.0.1:5000
 """
+import csv
+import io
 import json
+import logging
 import os
 import re
 import sqlite3
 import sys
 import webbrowser
 from datetime import datetime, date, timedelta
+from logging.handlers import RotatingFileHandler
 from threading import Timer
 
-from flask import Flask, render_template, request, jsonify, g, abort
+from flask import Flask, render_template, request, jsonify, g, abort, Response
 from jinja2 import DictLoader
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +111,16 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT NOT NULL,
+    level     TEXT NOT NULL,
+    action    TEXT NOT NULL,
+    entity    TEXT NOT NULL DEFAULT '',
+    entity_id INTEGER,
+    message   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
 CREATE TABLE IF NOT EXISTS reviews (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -133,6 +148,8 @@ def demo_daily_reset():
     row = db.execute("SELECT value FROM meta WHERE key = 'seeded_on'").fetchone()
     if not row or row["value"] != today().isoformat():
         seed_demo(db)
+        log_event(db, "INFO", "Ежедневный сброс", "Демо-данные автоматически возвращены к исходным")
+        db.commit()
 
 
 def over_demo_limit(db, table, extra=1):
@@ -192,7 +209,7 @@ def import_legacy(db):
              t.get("deadline", date.today().isoformat()),
              "выполнено" if done else "в работе", now, now if done else None),
         )
-    print(f"📥 Перенесено задач из project_data.json: {len(data.get('tasks', []))}")
+    log.info("Импорт | Перенесено задач из project_data.json: %s", len(data.get("tasks", [])))
 
 
 # ==================== ВСПОМОГАТЕЛЬНОЕ ====================
@@ -332,7 +349,81 @@ def ok(**kw):
 
 
 def fail(message, code=400):
+    """Отказ в операции: пользователю — понятное сообщение, в журнал — WARNING."""
+    try:
+        db = get_db()
+        log_event(db, "WARNING", "Отказ", f"{message} ({request.method} {request.path})")
+        db.commit()
+    except Exception:
+        log.exception("Не удалось записать отказ в журнал")
     return jsonify(success=False, error=message), code
+
+
+# ==================== ЛОГИРОВАНИЕ ====================
+# Два уровня, как в промышленных системах:
+#   1) технический лог-файл crm.log (ротация 1 МБ × 3) — для разработчика и сопровождения;
+#   2) журнал событий в базе (таблица events) — вкладка «Журнал» для аналитика и руководителя.
+# Уровни: DEBUG — подробности для отладки, INFO — бизнес-события, WARNING — отказы и возвраты,
+# ERROR — сбои. Уровень лог-файла задаётся переменной CRM_LOG_LEVEL (по умолчанию INFO).
+LOG_FILE = os.environ.get("CRM_LOG") or os.path.join(BASE_DIR, "crm.log")
+LOG_LEVEL = os.environ.get("CRM_LOG_LEVEL", "INFO").upper()
+LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
+EVENTS_KEEP = 2000  # сколько последних событий хранить в базе
+
+log = logging.getLogger("crm")
+
+
+def setup_logging():
+    if log.handlers:
+        return
+    log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    try:
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        log.addHandler(file_handler)
+    except OSError as e:
+        print(f"Лог-файл недоступен ({e}) — пишу только в консоль")
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    log.addHandler(console)
+    log.propagate = False
+
+
+setup_logging()
+
+
+def log_event(db, level, action, message, entity="", entity_id=None, ts=None):
+    """Событие: в журнал в базе (если уровень не DEBUG) и в технический лог-файл.
+    ts задаётся только для исторических событий (демо-данные) — их в лог-файл не пишем."""
+    level = level if level in LEVELS else "INFO"
+    if ts is None:
+        log.log(getattr(logging, level), "%s | %s", action, message)
+    if level == "DEBUG":
+        return
+    db.execute(
+        "INSERT INTO events (ts, level, action, entity, entity_id, message) VALUES (?, ?, ?, ?, ?, ?)",
+        (ts or now_iso(), level, action, entity, entity_id, str(message)[:500]),
+    )
+    db.execute("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?", (EVENTS_KEEP,))
+
+
+@app.errorhandler(Exception)
+def handle_error(e):
+    """Непредвиденный сбой: полная трассировка в лог (ERROR), пользователю — короткое сообщение."""
+    if isinstance(e, HTTPException):
+        return e
+    log.exception("Сбой при обработке %s %s", request.method, request.path)
+    try:
+        db = get_db()
+        db.rollback()
+        log_event(db, "ERROR", "Сбой", f"{type(e).__name__}: {e} ({request.method} {request.path})")
+        db.commit()
+    except Exception:
+        pass
+    if request.method == "POST":
+        return jsonify(success=False, error="Внутренняя ошибка. Она записана в журнал."), 500
+    return "Внутренняя ошибка. Она записана в журнал.", 500
 
 
 # ==================== РАЗБОР ИНТЕРВЬЮ -> ЗАДАЧИ ====================
@@ -638,6 +729,14 @@ LAYOUT = """
         .empty-state i { font-size: 3.5rem; margin-bottom: 10px; }
         .kpi-badge { font-size: 1rem; min-width: 52px; }
         .protocol { white-space: pre-wrap; background: #f8f9fa; border-radius: 10px; padding: 15px; }
+        .header-title { position: relative; }
+        .back-home {
+            position: absolute; top: 14px; left: 16px; color: #fff; text-decoration: none; font-size: .85rem;
+            padding: 5px 12px; border: 1px solid rgba(255,255,255,.35); border-radius: 20px; transition: background .2s;
+        }
+        .back-home:hover { background: rgba(255,255,255,.15); color: #fff; }
+        @media (max-width: 700px) { .back-home { position: static; display: inline-block; margin-bottom: 10px; } }
+        .lvl { font-size: .72rem; min-width: 70px; }
         {% block styles %}{% endblock %}
     </style>
 </head>
@@ -645,6 +744,7 @@ LAYOUT = """
 <div class="container-xl">
     <div class="main-card">
         <div class="header-title">
+            {% if root %}<a class="back-home" href="/" title="Вернуться к списку проектов"><i class="bi bi-arrow-left"></i> Все проекты</a>{% endif %}
             <h1><i class="bi bi-kanban"></i> CRM системного аналитика</h1>
             <p>Интервью → задачи → исполнители → KPI • Сегодня: {{ today_str }}</p>
             <div class="themes" role="group" aria-label="Оформление">
@@ -659,6 +759,7 @@ LAYOUT = """
             <li class="nav-item"><a class="nav-link {% if active_tab == 'interviews' %}active{% endif %}" href="{{ root }}/interviews"><i class="bi bi-chat-quote"></i> Интервью</a></li>
             <li class="nav-item"><a class="nav-link {% if active_tab == 'employees' %}active{% endif %}" href="{{ root }}/employees"><i class="bi bi-people"></i> Сотрудники</a></li>
             <li class="nav-item"><a class="nav-link {% if active_tab == 'kpi' %}active{% endif %}" href="{{ root }}/kpi"><i class="bi bi-graph-up-arrow"></i> KPI и качество</a></li>
+            <li class="nav-item"><a class="nav-link {% if active_tab == 'log' %}active{% endif %}" href="{{ root }}/log"><i class="bi bi-journal-text"></i> Журнал</a></li>
         </ul>
         {% if demo_mode %}
         <div class="alert alert-info d-flex flex-wrap align-items-center justify-content-between gap-2 py-2">
@@ -1376,7 +1477,66 @@ KPI = """
 {% endblock %}
 """
 
+LOG_PAGE = """
+{% extends "layout.html" %}
+{% block title %}Журнал — CRM аналитика{% endblock %}
+{% block content %}
+<div class="row row-cols-2 row-cols-md-4 g-3 mb-4">
+    <div class="col"><div class="stat-card"><div class="stat-number">{{ counts.total }}</div><div class="stat-label">Событий за сегодня</div></div></div>
+    <div class="col"><div class="stat-card info"><div class="stat-number">{{ counts.INFO }}</div><div class="stat-label">INFO — действия</div></div></div>
+    <div class="col"><div class="stat-card warning"><div class="stat-number">{{ counts.WARNING }}</div><div class="stat-label">WARNING — отказы и возвраты</div></div></div>
+    <div class="col"><div class="stat-card danger"><div class="stat-number">{{ counts.ERROR }}</div><div class="stat-label">ERROR — сбои</div></div></div>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+    <div class="col-6 col-md-3"><select name="level" class="form-select form-select-sm" onchange="this.form.submit()">
+        <option value="">Все уровни</option>
+        {% for l in ['INFO', 'WARNING', 'ERROR'] %}<option {% if level == l %}selected{% endif %}>{{ l }}</option>{% endfor %}
+    </select></div>
+    <div class="col-6 col-md-5"><input name="q" value="{{ q }}" class="form-control form-control-sm" placeholder="Поиск по тексту: задача, сотрудник, действие…"></div>
+    <div class="col-6 col-md-2"><button class="btn btn-sm btn-primary w-100"><i class="bi bi-search"></i> Найти</button></div>
+    <div class="col-6 col-md-2"><a class="btn btn-sm btn-outline-secondary w-100" href="{{ root }}/log.csv?level={{ level }}&q={{ q|urlencode }}"><i class="bi bi-download"></i> CSV</a></div>
+</form>
+
+{% if events %}
+<div class="table-responsive">
+<table class="table table-sm table-hover align-middle">
+    <thead><tr><th>Время</th><th>Уровень</th><th>Действие</th><th>Описание</th><th>Объект</th></tr></thead>
+    <tbody>
+    {% for e in events %}
+    <tr>
+        <td class="text-nowrap small">{{ e.ts|ru_datetime }}</td>
+        <td><span class="badge lvl text-bg-{{ {'INFO': 'primary', 'WARNING': 'warning', 'ERROR': 'danger'}[e.level] }}">{{ e.level }}</span></td>
+        <td class="text-nowrap"><b>{{ e.action }}</b></td>
+        <td>{{ e.message }}</td>
+        <td class="text-nowrap small">
+            {% if e.entity == 'interview' and e.entity_id %}<a href="{{ root }}/interviews/{{ e.entity_id }}">интервью #{{ e.entity_id }}</a>
+            {% elif e.entity == 'task' and e.entity_id %}задача #{{ e.entity_id }}
+            {% elif e.entity == 'employee' and e.entity_id %}сотрудник #{{ e.entity_id }}
+            {% else %}—{% endif %}
+        </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+</div>
+<p class="small text-muted">Показаны последние {{ events|length }} событий{% if level or q %} по фильтру{% endif %}. В базе хранится до {{ keep }} событий.</p>
+{% else %}
+<div class="empty-state"><i class="bi bi-journal"></i><h5>Событий не найдено</h5></div>
+{% endif %}
+
+<div class="alert alert-light border small mt-3">
+    <b>Как устроено логирование.</b> Каждое действие в CRM фиксируется дважды: в этом журнале (для аналитика и руководителя)
+    и в техническом лог-файле <code>crm.log</code> с ротацией (для разработчика и сопровождения).
+    Уровни: <b>DEBUG</b> — подробности для отладки (только в файле), <b>INFO</b> — бизнес-события,
+    <b>WARNING</b> — отказы, возвраты на доработку, удаления, <b>ERROR</b> — сбои с полной трассировкой в файле.
+    Текущий уровень лог-файла: <b>{{ log_level }}</b> (переменная окружения <code>CRM_LOG_LEVEL</code>).
+</div>
+{% endblock %}
+"""
+
 app.jinja_env.loader = DictLoader({
+    "log.html": LOG_PAGE,
     "layout.html": LAYOUT,
     "index.html": INDEX,
     "interviews.html": INTERVIEWS,
@@ -1476,8 +1636,16 @@ def task_add():
     except ValueError as e:
         return fail(str(e))
     task_id = insert_task(db, title, desc, dept, emp_id, None, prio, deadline, hours)
+    log_event(db, "INFO", "Задача создана вручную",
+              f"#{task_id} «{title}» → {dept}, исполнитель: {emp_name(db, emp_id)}, срок {ru_date(deadline)}",
+              "task", task_id)
     db.commit()
     return ok(task_id=task_id)
+
+
+def emp_name(db, emp_id):
+    row = emp_id and db.execute("SELECT name FROM employees WHERE id = ?", (emp_id,)).fetchone()
+    return row["name"] if row else "не назначен"
 
 
 @app.route("/task/<int:task_id>/timer", methods=["POST"])
@@ -1490,8 +1658,13 @@ def task_timer(task_id):
     if action == "start":
         if not t["timer_started_at"]:
             db.execute("UPDATE tasks SET timer_started_at = ?, status = 'в работе' WHERE id = ?", (now_iso(), task_id))
+            log_event(db, "INFO", "Таймер запущен", f"#{task_id} «{t['title']}» ({emp_name(db, t['employee_id'])})",
+                      "task", task_id)
     elif action == "stop":
         stop_timer(db, t)
+        spent = db.execute("SELECT spent_seconds FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+        log_event(db, "INFO", "Таймер остановлен", f"#{task_id} «{t['title']}», всего {fmt_duration(spent)}",
+                  "task", task_id)
     else:
         return fail("Неизвестное действие")
     db.commit()
@@ -1509,6 +1682,8 @@ def task_status(task_id):
         return fail("Сначала назначьте исполнителя")
     stop_timer(db, t)
     db.execute("UPDATE tasks SET status = 'на проверке' WHERE id = ?", (task_id,))
+    log_event(db, "INFO", "Отправлена на проверку", f"#{task_id} «{t['title']}» ({emp_name(db, t['employee_id'])})",
+              "task", task_id)
     db.commit()
     return ok()
 
@@ -1533,6 +1708,14 @@ def task_review(task_id):
         "INSERT INTO reviews (task_id, result, comment, created_at) VALUES (?, ?, ?, ?)",
         (task_id, result, comment, now_iso()),
     )
+    who = emp_name(db, t["employee_id"])
+    if result == "принято":
+        on_time = today() <= parse_date(t["deadline"])
+        log_event(db, "INFO", "Работа принята",
+                  f"#{task_id} «{t['title']}» ({who}), {'в срок' if on_time else 'с опозданием'}", "task", task_id)
+    else:
+        log_event(db, "WARNING", "Возврат на доработку", f"#{task_id} «{t['title']}» ({who}): {comment}",
+                  "task", task_id)
     db.commit()
     return ok()
 
@@ -1545,7 +1728,10 @@ def task_assign(task_id):
     emp_id = int(raw) if raw.isdigit() else None
     if emp_id and not db.execute("SELECT 1 FROM employees WHERE id = ?", (emp_id,)).fetchone():
         return fail("Сотрудник не найден")
+    t = get_task(db, task_id)
     db.execute("UPDATE tasks SET employee_id = ? WHERE id = ?", (emp_id, task_id))
+    log_event(db, "INFO", "Смена исполнителя",
+              f"#{task_id} «{t['title']}»: {emp_name(db, t['employee_id'])} → {emp_name(db, emp_id)}", "task", task_id)
     db.commit()
     return ok()
 
@@ -1553,7 +1739,9 @@ def task_assign(task_id):
 @app.route("/task/<int:task_id>/delete", methods=["POST"])
 def task_delete(task_id):
     db = get_db()
+    t = get_task(db, task_id)
     db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    log_event(db, "WARNING", "Задача удалена", f"#{task_id} «{t['title']}» ({t['status']})", "task", task_id)
     db.commit()
     return ok()
 
@@ -1611,6 +1799,8 @@ def interviews_parse():
         ))
     if not items:
         return fail("Не нашёл требований. Сформулируйте тезисы: «Нужно…», «Должно…», «Хочу, чтобы…»")
+    by_dept = ", ".join(f"{d}: {sum(i['department'] == d for i in items)}" for d in DEPARTMENTS)
+    log_event(db, "DEBUG", "Разбор протокола", f"{len(text)} символов → {len(items)} тезисов ({by_dept})")
     return ok(items=items)
 
 
@@ -1641,9 +1831,16 @@ def interviews_save():
              (d.get("stakeholder") or "").strip()[:150], meeting, text,
              "голос" if d.get("source") == "голос" else "текст", now_iso()),
         ).lastrowid
+        source = "голос" if d.get("source") == "голос" else "текст"
+        log_event(db, "INFO", "Интервью сохранено",
+                  f"«{(d.get('title') or '').strip()[:80] or 'Интервью'}» ({source}), задач: {len(cleaned)}",
+                  "interview", interview_id)
         for (title, desc, dept, prio, deadline, hours), raw_emp in cleaned:
             emp_id = resolve_employee(raw_emp, dept, load, emps)
-            insert_task(db, title, desc, dept, emp_id, interview_id, prio, deadline, hours)
+            task_id = insert_task(db, title, desc, dept, emp_id, interview_id, prio, deadline, hours)
+            log_event(db, "INFO", "Задача из интервью",
+                      f"#{task_id} «{title}» → {dept}, исполнитель: {emp_name(db, emp_id)}, срок {ru_date(deadline)}",
+                      "task", task_id)
         db.commit()
     except ValueError as e:
         db.rollback()
@@ -1752,6 +1949,26 @@ def seed_demo(db):
         "UPDATE tasks SET deadline = ? WHERE deadline = ? AND status = 'новая'",
         ((base + timedelta(days=7)).isoformat(), base.isoformat()),
     )
+    # История событий для журнала — как если бы всё это делали люди
+    db.execute("DELETE FROM events")
+    for i in db.execute("SELECT * FROM interviews ORDER BY id").fetchall():
+        log_event(db, "INFO", "Интервью сохранено", f"«{i['title']}» ({i['source']})", "interview", i["id"],
+                  ts=i["created_at"])
+    for t in db.execute(TASKS_SQL + " ORDER BY t.id").fetchall():
+        log_event(db, "INFO", "Задача из интервью",
+                  f"#{t['id']} «{t['title']}» → {t['department']}, исполнитель: {t['employee_name'] or 'не назначен'}",
+                  "task", t["id"], ts=t["created_at"])
+        if t["timer_started_at"]:
+            log_event(db, "INFO", "Таймер запущен", f"#{t['id']} «{t['title']}» ({t['employee_name']})",
+                      "task", t["id"], ts=t["timer_started_at"])
+    for r in db.execute("SELECT r.*, t.title FROM reviews r JOIN tasks t ON t.id = r.task_id ORDER BY r.id").fetchall():
+        if r["result"] == "принято":
+            log_event(db, "INFO", "Работа принята", f"#{r['task_id']} «{r['title']}»", "task", r["task_id"],
+                      ts=r["created_at"])
+        else:
+            log_event(db, "WARNING", "Возврат на доработку", f"#{r['task_id']} «{r['title']}»: {r['comment']}",
+                      "task", r["task_id"], ts=r["created_at"])
+    log_event(db, "INFO", "Статус сотрудника", "Лебедева Мария: больничный", "employee", None, ts=day(-1, 9))
     db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded_on', ?)", (base.isoformat(),))
     db.commit()
 
@@ -1760,7 +1977,10 @@ def seed_demo(db):
 def demo_reset():
     if not DEMO_MODE:
         return fail("Сброс доступен только в демо-версии", 403)
-    seed_demo(get_db())
+    db = get_db()
+    seed_demo(db)
+    log_event(db, "INFO", "Демо-данные сброшены", "Посетитель вернул демо-версию к исходному состоянию")
+    db.commit()
     return ok()
 
 
@@ -1790,10 +2010,11 @@ def employees_add():
     db = get_db()
     if over_demo_limit(db, "employees"):
         return fail(DEMO_LIMIT_MESSAGE)
-    db.execute(
+    emp_id = db.execute(
         "INSERT INTO employees (name, department, position, created_at) VALUES (?, ?, ?, ?)",
         (name[:80], d["department"], (d.get("position") or "").strip()[:80], now_iso()),
-    )
+    ).lastrowid
+    log_event(db, "INFO", "Сотрудник добавлен", f"{name[:80]} ({d['department']})", "employee", emp_id)
     db.commit()
     return ok()
 
@@ -1807,6 +2028,7 @@ def employees_demo():
                 "INSERT INTO employees (name, department, position, created_at) VALUES (?, ?, ?, ?)",
                 (name, dept, position, now_iso()),
             )
+    log_event(db, "INFO", "Демо-команда добавлена", f"{len(DEMO_TEAM)} сотрудников по четырём отделам")
     db.commit()
     return ok()
 
@@ -1834,6 +2056,8 @@ def employees_status(emp_id):
         "UPDATE employees SET status = ?, absent_from = ?, absent_to = ? WHERE id = ?",
         (status, absent_from, absent_to, emp_id),
     )
+    period = f" с {ru_date(absent_from)} по {ru_date(absent_to)}" if absent_from else ""
+    log_event(db, "INFO", "Статус сотрудника", f"{emp_name(db, emp_id)}: {status}{period}", "employee", emp_id)
     db.commit()
     return ok()
 
@@ -1841,7 +2065,13 @@ def employees_status(emp_id):
 @app.route("/employees/<int:emp_id>/delete", methods=["POST"])
 def employees_delete(emp_id):
     db = get_db()
+    name = emp_name(db, emp_id)
+    open_tasks = db.execute(
+        "SELECT COUNT(*) FROM tasks WHERE employee_id = ? AND status != 'выполнено'", (emp_id,)
+    ).fetchone()[0]
     db.execute("DELETE FROM employees WHERE id = ?", (emp_id,))
+    log_event(db, "WARNING", "Сотрудник удалён", f"{name}; без исполнителя осталось задач: {open_tasks}",
+              "employee", emp_id)
     db.commit()
     return ok()
 
@@ -1872,6 +2102,46 @@ def kpi_page():
         checks=db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
         returns_total=db.execute("SELECT COUNT(*) FROM reviews WHERE result = 'возврат'").fetchone()[0],
         active_tab="kpi",
+    )
+
+
+# ==================== МАРШРУТЫ: ЖУРНАЛ ====================
+def query_events(db, level, q, limit):
+    sql, args = "SELECT * FROM events WHERE 1 = 1", []
+    if level in LEVELS:
+        sql += " AND level = ?"
+        args.append(level)
+    if q:
+        sql += " AND (lower(message) LIKE ? OR lower(action) LIKE ?)"
+        args += [f"%{q.lower()}%"] * 2
+    return db.execute(sql + " ORDER BY ts DESC, id DESC LIMIT ?", (*args, limit)).fetchall()
+
+
+@app.route("/log")
+def log_page():
+    db = get_db()
+    level, q = request.args.get("level", ""), request.args.get("q", "").strip()[:100]
+    counts = {lvl: 0 for lvl in LEVELS}
+    for r in db.execute("SELECT level, COUNT(*) AS n FROM events WHERE ts >= ? GROUP BY level", (today().isoformat(),)):
+        counts[r["level"]] = r["n"]
+    counts["total"] = sum(counts[lvl] for lvl in LEVELS)
+    return render_template(
+        "log.html", events=query_events(db, level, q, 300), counts=counts, level=level, q=q,
+        keep=EVENTS_KEEP, log_level=LOG_LEVEL, active_tab="log",
+    )
+
+
+@app.route("/log.csv")
+def log_csv():
+    level, q = request.args.get("level", ""), request.args.get("q", "").strip()[:100]
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=";")
+    writer.writerow(["Время", "Уровень", "Действие", "Описание", "Объект", "ID"])
+    for e in query_events(get_db(), level, q, EVENTS_KEEP):
+        writer.writerow([e["ts"], e["level"], e["action"], e["message"], e["entity"], e["entity_id"] or ""])
+    return Response(
+        "﻿" + buf.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=crm_log.csv"},
     )
 
 
