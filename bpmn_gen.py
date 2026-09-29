@@ -21,7 +21,7 @@
 """
 import re
 from itertools import count
-from xml.sax.saxutils import escape, quoteattr
+from xml.sax.saxutils import quoteattr
 
 # ---------- Размеры и сетка раскладки (в пикселях) ----------
 TASK_W, TASK_H = 120, 80
