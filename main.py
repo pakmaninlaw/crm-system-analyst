@@ -31,6 +31,8 @@ from flask import Flask, render_template, request, jsonify, g, abort, Response
 from jinja2 import DictLoader
 from werkzeug.exceptions import HTTPException
 
+import bpmn_gen
+
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.environ.get("CRM_DB") or os.path.join(BASE_DIR, "crm.db")
@@ -51,7 +53,7 @@ EMP_STATUSES = ["работает", "больничный", "отпуск"]
 # Демо-режим для публичной версии (портфолио): база заполняется примером, сбрасывается раз в сутки
 # и защищена лимитами от ботов и случайного «засорения»
 DEMO_MODE = os.environ.get("CRM_DEMO") == "1"
-DEMO_LIMITS = {"text": 8000, "tasks_per_interview": 30, "tasks": 300, "employees": 40, "interviews": 60}
+DEMO_LIMITS = {"text": 8000, "tasks_per_interview": 30, "tasks": 300, "employees": 40, "interviews": 60, "diagrams": 60}
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
 
 EXAMPLE_INTERVIEW = """Встреча с отделом продаж, стейкхолдер — руководитель направления.
@@ -121,6 +123,16 @@ CREATE TABLE IF NOT EXISTS events (
     message   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+CREATE TABLE IF NOT EXISTS diagrams (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    title        TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'вручную',
+    interview_id INTEGER REFERENCES interviews(id) ON DELETE SET NULL,
+    text         TEXT NOT NULL DEFAULT '',
+    xml          TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reviews (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -610,182 +622,231 @@ LAYOUT = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}CRM аналитика{% endblock %}</title>
     <script>try { document.documentElement.dataset.theme = new URLSearchParams(location.search).get('theme') || localStorage.getItem('sa-theme') || 'classic'; } catch (e) { document.documentElement.dataset.theme = 'classic'; }</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
+    {% block head %}{% endblock %}
     <style>
-        /* Темы оформления (общие с витриной портфолио): classic, graphite, bordeaux, violet */
+        /* ===== Темы: меняют боковую панель и акцент (общие с витриной портфолио) ===== */
         :root, :root[data-theme="classic"] {
-            --page-bg: linear-gradient(135deg, #e9edf2 0%, #d9dfe7 100%);
-            --head-bg: linear-gradient(135deg, #1f2a44, #33486b);
-            --accent: #1f4e79; --accent-dark: #163a5a; --accent-soft: #d5dfea; --footer: #6c757d;
+            --side-bg: linear-gradient(180deg, #0b1437 0%, #111c4e 100%); --side-active: #2563eb;
+            --accent: #2563eb; --accent-dark: #1d4ed8; --accent-soft: #dbe6ff;
         }
         :root[data-theme="graphite"] {
-            --page-bg: linear-gradient(135deg, #3a3f47 0%, #23272d 100%);
-            --head-bg: linear-gradient(135deg, #343a40, #50575f);
-            --accent: #495057; --accent-dark: #343a40; --accent-soft: #dee2e6; --footer: rgba(255,255,255,.55);
+            --side-bg: linear-gradient(180deg, #17191d 0%, #25282e 100%); --side-active: #4b5563;
+            --accent: #374151; --accent-dark: #1f2937; --accent-soft: #e5e7eb;
         }
         :root[data-theme="bordeaux"] {
-            --page-bg: linear-gradient(135deg, #f0ebe7 0%, #e3d9d3 100%);
-            --head-bg: linear-gradient(135deg, #5a1a2b, #83344a);
-            --accent: #7a2a3e; --accent-dark: #5a1a2b; --accent-soft: #eddbe0; --footer: #7d6b6f;
+            --side-bg: linear-gradient(180deg, #2a0c16 0%, #4a1626 100%); --side-active: #9f1239;
+            --accent: #9f1239; --accent-dark: #7f1030; --accent-soft: #fde2e8;
         }
         :root[data-theme="violet"] {
-            --page-bg: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            --head-bg: linear-gradient(135deg, #667eea, #764ba2);
-            --accent: #5a4fcf; --accent-dark: #4a3fbf; --accent-soft: #e3e0fb; --footer: rgba(255,255,255,.55);
+            --side-bg: linear-gradient(180deg, #1e1b4b 0%, #3b2a7a 100%); --side-active: #7c3aed;
+            --accent: #6d28d9; --accent-dark: #5b21b6; --accent-soft: #ede9fe;
         }
+        :root {
+            --page: #f1f4fa; --card: #ffffff; --text: #0f172a; --muted: #64748b; --line: #e6eaf2;
+            --g-blue: linear-gradient(135deg, #4f6cff, #6a3df0);
+            --g-green: linear-gradient(135deg, #22c55e, #059669);
+            --g-orange: linear-gradient(135deg, #fb923c, #f97316);
+            --g-sky: linear-gradient(135deg, #0ea5e9, #2563eb);
+            --g-pink: linear-gradient(135deg, #f43f5e, #db2777);
+            --g-teal: linear-gradient(135deg, #14b8a6, #0891b2);
+            --g-purple: linear-gradient(135deg, #a855f7, #7c3aed);
+            --sidebar-w: 248px;
+        }
+        * { box-sizing: border-box; }
+        body { background: var(--page); color: var(--text); font-family: 'Inter', 'Segoe UI', sans-serif; font-size: 14.5px; }
+
+        /* ===== Боковая панель ===== */
+        .sidebar {
+            position: fixed; inset: 0 auto 0 0; width: var(--sidebar-w); background: var(--side-bg); color: #cbd5f5;
+            display: flex; flex-direction: column; z-index: 1040; transition: transform .3s;
+        }
+        .brand { display: flex; gap: 12px; align-items: center; padding: 20px 18px 18px; border-bottom: 1px solid rgba(255,255,255,.08); }
+        .brand .logo { width: 42px; height: 42px; border-radius: 12px; background: var(--g-blue); display: grid; place-items: center; color: #fff; font-size: 1.3rem; box-shadow: 0 6px 18px rgba(79,108,255,.45); }
+        .brand b { color: #fff; font-size: 1.02rem; display: block; line-height: 1.2; }
+        .brand small { color: #93a3d8; font-size: .75rem; }
+        .side-nav { padding: 14px 12px; flex: 1; overflow-y: auto; }
+        .side-nav .sect { font-size: .68rem; text-transform: uppercase; letter-spacing: .1em; color: #7383b8; margin: 14px 10px 6px; }
+        .side-link {
+            display: flex; align-items: center; gap: 12px; padding: 10px 12px; margin-bottom: 3px; border-radius: 10px;
+            color: #cbd5f5; text-decoration: none; font-weight: 500; transition: background .2s, color .2s, transform .2s;
+        }
+        .side-link i { font-size: 1.1rem; width: 22px; text-align: center; }
+        .side-link:hover { background: rgba(255,255,255,.08); color: #fff; transform: translateX(3px); }
+        .side-link.active { background: var(--side-active); color: #fff; box-shadow: 0 6px 16px rgba(0,0,0,.25); }
+        .side-link .count { margin-left: auto; font-size: .72rem; background: rgba(255,255,255,.15); padding: 1px 8px; border-radius: 10px; }
+        .side-bottom { padding: 14px 16px 18px; border-top: 1px solid rgba(255,255,255,.08); }
+        .side-bottom .back { color: #cbd5f5; text-decoration: none; font-size: .88rem; display: inline-flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+        .side-bottom .back:hover { color: #fff; }
+        .themes { display: flex; gap: 8px; align-items: center; font-size: .75rem; color: #7383b8; }
+        .themes button { width: 20px; height: 20px; border-radius: 50%; border: 2px solid rgba(255,255,255,.3); padding: 0; background: var(--sw); cursor: pointer; transition: transform .2s; }
+        .themes button:hover { transform: scale(1.2); }
+        .themes button[aria-pressed="true"] { border-color: #fff; }
+        .t-classic { --sw: linear-gradient(135deg, #0b1437 50%, #2563eb 50%); }
+        .t-graphite { --sw: linear-gradient(135deg, #17191d 50%, #9ca3af 50%); }
+        .t-bordeaux { --sw: linear-gradient(135deg, #2a0c16 50%, #d8b98a 50%); }
+        .t-violet { --sw: linear-gradient(135deg, #1e1b4b 50%, #a855f7 50%); }
+
+        /* ===== Основная область ===== */
+        .main { margin-left: var(--sidebar-w); min-height: 100vh; padding: 0 26px 30px; }
+        .topbar {
+            position: sticky; top: 0; z-index: 1030; background: rgba(241,244,250,.92); backdrop-filter: blur(8px);
+            display: flex; align-items: center; gap: 14px; padding: 16px 0 14px; margin-bottom: 8px;
+        }
+        .topbar h2 { font-size: 1.35rem; font-weight: 700; margin: 0; }
+        .topbar .sub { color: var(--muted); font-size: .85rem; }
+        .topbar .right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+        .chip { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 7px 12px; font-size: .85rem; color: var(--text); display: inline-flex; gap: 8px; align-items: center; white-space: nowrap; }
+        .chip.demo { background: #fff7e6; border-color: #fde2b3; color: #92400e; }
+        .avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--g-blue); color: #fff; display: grid; place-items: center; font-weight: 700; }
+        .burger { display: none; border: 0; background: #fff; border-radius: 10px; width: 40px; height: 40px; }
+
+        /* ===== Карточки ===== */
+        .panel { background: var(--card); border-radius: 16px; border: 1px solid var(--line); box-shadow: 0 4px 18px rgba(15,23,42,.04); padding: 18px 20px; margin-bottom: 20px; }
+        .panel-title { font-weight: 700; font-size: 1rem; margin: 0 0 14px; display: flex; align-items: center; gap: 8px; }
+        .panel-title .muted { font-weight: 500; color: var(--muted); font-size: .85rem; }
+        .panel-title .link { margin-left: auto; font-weight: 600; font-size: .85rem; text-decoration: none; color: var(--accent); }
+        .card { border-radius: 16px; border: 1px solid var(--line); box-shadow: 0 4px 18px rgba(15,23,42,.04); }
+
+        /* Яркие карточки-показатели (как на дашборде из примера) */
+        .stat-card {
+            position: relative; overflow: hidden; border-radius: 16px; padding: 18px 18px 16px; color: #fff; height: 100%;
+            background: var(--g-blue); box-shadow: 0 10px 24px -10px rgba(79,108,255,.55); transition: transform .25s, box-shadow .25s;
+        }
+        .stat-card:hover { transform: translateY(-4px); }
+        .stat-card::after { content: ""; position: absolute; right: -30px; bottom: -40px; width: 120px; height: 120px; border-radius: 50%; background: rgba(255,255,255,.12); }
+        .stat-card.info { background: var(--g-teal); box-shadow: 0 10px 24px -10px rgba(20,184,166,.55); }
+        .stat-card.warning { background: var(--g-orange); box-shadow: 0 10px 24px -10px rgba(249,115,22,.55); }
+        .stat-card.danger { background: var(--g-pink); box-shadow: 0 10px 24px -10px rgba(244,63,94,.55); }
+        .stat-card.success { background: var(--g-green); box-shadow: 0 10px 24px -10px rgba(34,197,94,.55); }
+        .stat-card.sky { background: var(--g-sky); box-shadow: 0 10px 24px -10px rgba(14,165,233,.55); }
+        .stat-card.purple { background: var(--g-purple); box-shadow: 0 10px 24px -10px rgba(168,85,247,.55); }
+        .stat-number { font-size: 1.9rem; font-weight: 800; line-height: 1.1; margin-top: 6px; position: relative; z-index: 1; }
+        .stat-label { font-size: .82rem; font-weight: 600; opacity: .95; position: relative; z-index: 1; }
+        .stat-foot { font-size: .75rem; opacity: .9; margin-top: 8px; position: relative; z-index: 1; }
+        .stat-icon { position: absolute; top: 14px; right: 14px; width: 40px; height: 40px; border-radius: 12px; background: rgba(255,255,255,.2); display: grid; place-items: center; font-size: 1.2rem; }
+
+        /* ===== Таблицы ===== */
+        .table { --bs-table-bg: transparent; margin-bottom: 0; }
+        .table thead th { background: #f6f8fc; color: #475569; font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; border-bottom: 1px solid var(--line); padding: 11px 12px; white-space: nowrap; }
+        .table td { vertical-align: middle; border-color: var(--line); padding: 10px 12px; }
+        .task-row { transition: background .2s; border-left: 4px solid transparent; }
+        .task-row:hover { background: #f8faff; }
+        .task-row.overdue { border-left-color: #f43f5e; background: #fff6f8; }
+        .task-row.review { border-left-color: #f59e0b; background: #fffbeb; }
+        .task-row.done { border-left-color: #22c55e; background: #f3fdf6; }
+        .task-row.done td { opacity: .8; }
+
+        .dept { display: inline-flex; gap: 5px; align-items: center; padding: 3px 10px; border-radius: 20px; font-size: .76rem; font-weight: 600; white-space: nowrap; }
+        .dept-frontend { background: #e0f2fe; color: #0369a1; }
+        .dept-backend { background: #ede9fe; color: #6d28d9; }
+        .dept-architecture { background: #ffedd5; color: #c2410c; }
+        .dept-security { background: #ffe4e6; color: #be123c; }
+
         .btn-primary { --bs-btn-bg: var(--accent); --bs-btn-border-color: var(--accent); --bs-btn-hover-bg: var(--accent-dark);
             --bs-btn-hover-border-color: var(--accent-dark); --bs-btn-active-bg: var(--accent-dark); --bs-btn-active-border-color: var(--accent-dark); }
         .btn-outline-primary { --bs-btn-color: var(--accent); --bs-btn-border-color: var(--accent); --bs-btn-hover-bg: var(--accent);
             --bs-btn-hover-border-color: var(--accent); --bs-btn-active-bg: var(--accent); --bs-btn-active-border-color: var(--accent); }
-        .themes { display: flex; justify-content: center; gap: 8px; margin-top: 12px; }
-        .themes button { width: 20px; height: 20px; border-radius: 50%; border: 2px solid rgba(255,255,255,.35); padding: 0;
-            background: var(--sw); cursor: pointer; transition: transform .2s; }
-        .themes button:hover { transform: scale(1.2); }
-        .themes button[aria-pressed="true"] { border-color: #fff; }
-        .t-classic { --sw: linear-gradient(135deg, #1f3a5f 50%, #c9a86a 50%); }
-        .t-graphite { --sw: linear-gradient(135deg, #3a3f47 50%, #d9dde3 50%); }
-        .t-bordeaux { --sw: linear-gradient(135deg, #5a1a2b 50%, #d8b98a 50%); }
-        .t-violet { --sw: linear-gradient(135deg, #764ba2 50%, #4fd1c5 50%); }
-        body {
-            background: var(--page-bg);
-            min-height: 100vh;
-            font-family: 'Segoe UI', Tahoma, sans-serif;
-            padding: 20px 0;
-        }
-        .main-card {
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            padding: 30px;
-            margin-bottom: 20px;
-        }
-        .header-title {
-            background: var(--head-bg);
-            color: white;
-            padding: 25px;
-            border-radius: 15px;
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        .header-title h1 { margin: 0; font-size: 2rem; }
-        .header-title p { margin: 5px 0 0 0; opacity: 0.9; }
-        .nav-pills .nav-link { color: var(--accent); border: 1px solid var(--accent-soft); }
-        .nav-pills .nav-link.active { background: var(--head-bg); border-color: transparent; }
-
-        .stat-card {
-            background: linear-gradient(135deg, #f5f7fa, #e8ecf3);
-            border-radius: 12px;
-            padding: 18px;
-            text-align: center;
-            border-left: 5px solid var(--accent);
-            transition: transform 0.2s;
-            height: 100%;
-        }
-        .stat-card:hover { transform: translateY(-3px); }
-        .stat-card.danger { border-left-color: #dc3545; }
-        .stat-card.success { border-left-color: #28a745; }
-        .stat-card.warning { border-left-color: #ffc107; }
-        .stat-card.info { border-left-color: #0dcaf0; }
-        .stat-number { font-size: 2.2rem; font-weight: bold; color: #333; }
-        .stat-label { color: #666; font-size: 0.8rem; text-transform: uppercase; }
-
-        .task-row { transition: all 0.3s; border-left: 4px solid transparent; }
-        .task-row:hover { background-color: #f8f9fa; }
-        .task-row.overdue { border-left-color: #dc3545; background-color: #fff5f5; }
-        .task-row.review { border-left-color: #ffc107; background-color: #fffbeb; }
-        .task-row.done { border-left-color: #28a745; background-color: #f0fff4; opacity: 0.8; }
-
-        .dept { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
-        .dept-frontend { background: #e0f7fb; color: #087990; }
-        .dept-backend { background: #efe7fb; color: #59359a; }
-        .dept-architecture { background: #fff0e1; color: #b35900; }
-        .dept-security { background: #fde8ea; color: #b02a37; }
-
-        .btn-action { border-radius: 8px; padding: 5px 10px; margin: 0 1px; transition: all 0.2s; }
+        .btn { border-radius: 10px; }
+        .btn-action { border-radius: 8px; padding: 4px 9px; margin: 0 1px; transition: transform .2s; }
         .btn-action:hover { transform: scale(1.1); }
+        .form-control, .form-select { border-radius: 10px; border-color: var(--line); }
         .timer { font-family: Consolas, monospace; font-weight: 600; }
-        .timer.running { color: #0d6efd; }
-        .timer.running::before { content: "● "; color: #dc3545; animation: blink 1s infinite; }
+        .timer.running { color: var(--accent); }
+        .timer.running::before { content: "● "; color: #f43f5e; animation: blink 1s infinite; }
         @keyframes blink { 50% { opacity: 0; } }
-
-        .table thead { background: var(--head-bg); color: white; }
-        .table > thead { --bs-table-bg: transparent; --bs-table-color: #fff; }
-        .table thead th { border: none; padding: 12px; font-weight: 600; white-space: nowrap; }
-        .table td { vertical-align: middle; }
+        .lvl { font-size: .7rem; min-width: 70px; }
+        .kpi-badge { font-size: .9rem; min-width: 48px; }
+        .protocol { white-space: pre-wrap; background: #f8fafc; border-radius: 12px; padding: 15px; border: 1px solid var(--line); }
+        .empty-state { text-align: center; padding: 44px 20px; color: #94a3b8; }
+        .empty-state i { font-size: 3rem; margin-bottom: 8px; display: block; }
 
         .notification {
-            position: fixed; top: 20px; right: 20px; min-width: 300px; max-width: 480px;
-            padding: 15px 20px; border-radius: 10px; color: white; font-weight: 500;
-            z-index: 9999; box-shadow: 0 10px 30px rgba(0,0,0,0.2); animation: slideIn 0.3s ease-out;
-            white-space: pre-line;
+            position: fixed; top: 18px; right: 18px; min-width: 300px; max-width: 460px; padding: 14px 18px; border-radius: 12px;
+            color: #fff; font-weight: 500; z-index: 9999; box-shadow: 0 12px 30px rgba(0,0,0,.2); animation: slideIn .3s ease-out; white-space: pre-line;
         }
-        .notification.success { background: linear-gradient(135deg, #28a745, #20c997); }
-        .notification.danger { background: linear-gradient(135deg, #dc3545, #fd7e14); }
-        .notification.info { background: linear-gradient(135deg, #0d6efd, #6610f2); }
+        .notification.success { background: var(--g-green); }
+        .notification.danger { background: var(--g-pink); }
+        .notification.info { background: var(--g-blue); }
         @keyframes slideIn { from { transform: translateX(400px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-        .empty-state { text-align: center; padding: 50px 20px; color: #999; }
-        .empty-state i { font-size: 3.5rem; margin-bottom: 10px; }
-        .kpi-badge { font-size: 1rem; min-width: 52px; }
-        .protocol { white-space: pre-wrap; background: #f8f9fa; border-radius: 10px; padding: 15px; }
-        .header-title { position: relative; }
-        .back-home {
-            position: absolute; top: 14px; left: 16px; color: #fff; text-decoration: none; font-size: .85rem;
-            padding: 5px 12px; border: 1px solid rgba(255,255,255,.35); border-radius: 20px; transition: background .2s;
+        @media (max-width: 992px) {
+            .sidebar { transform: translateX(-100%); }
+            body.side-open .sidebar { transform: none; }
+            .main { margin-left: 0; padding: 0 14px 24px; }
+            .burger { display: inline-grid; place-items: center; }
+            .topbar .right .chip.date { display: none; }
         }
-        .back-home:hover { background: rgba(255,255,255,.15); color: #fff; }
-        @media (max-width: 700px) { .back-home { position: static; display: inline-block; margin-bottom: 10px; } }
-        .lvl { font-size: .72rem; min-width: 70px; }
         {% block styles %}{% endblock %}
     </style>
 </head>
 <body>
-<div class="container-xl">
-    <div class="main-card">
-        <div class="header-title">
-            {% if root %}<a class="back-home" href="/" title="Вернуться к списку проектов"><i class="bi bi-arrow-left"></i> Все проекты</a>{% endif %}
-            <h1><i class="bi bi-kanban"></i> CRM системного аналитика</h1>
-            <p>Интервью → задачи → исполнители → KPI • Сегодня: {{ today_str }}</p>
-            <div class="themes" role="group" aria-label="Оформление">
-                <button class="t-classic" data-theme="classic" title="Классика"></button>
-                <button class="t-graphite" data-theme="graphite" title="Графит"></button>
-                <button class="t-bordeaux" data-theme="bordeaux" title="Бордо"></button>
-                <button class="t-violet" data-theme="violet" title="Фиолетовая"></button>
-            </div>
-        </div>
-        <ul class="nav nav-pills mb-4 gap-2 flex-wrap">
-            <li class="nav-item"><a class="nav-link {% if active_tab == 'tasks' %}active{% endif %}" href="{{ root }}/"><i class="bi bi-list-task"></i> Задачи</a></li>
-            <li class="nav-item"><a class="nav-link {% if active_tab == 'interviews' %}active{% endif %}" href="{{ root }}/interviews"><i class="bi bi-chat-quote"></i> Интервью</a></li>
-            <li class="nav-item"><a class="nav-link {% if active_tab == 'employees' %}active{% endif %}" href="{{ root }}/employees"><i class="bi bi-people"></i> Сотрудники</a></li>
-            <li class="nav-item"><a class="nav-link {% if active_tab == 'kpi' %}active{% endif %}" href="{{ root }}/kpi"><i class="bi bi-graph-up-arrow"></i> KPI и качество</a></li>
-            <li class="nav-item"><a class="nav-link {% if active_tab == 'log' %}active{% endif %}" href="{{ root }}/log"><i class="bi bi-journal-text"></i> Журнал</a></li>
-        </ul>
-        {% if demo_mode %}
-        <div class="alert alert-info d-flex flex-wrap align-items-center justify-content-between gap-2 py-2">
-            <span><i class="bi bi-info-circle"></i> <b>Демо-версия.</b> Данные общие для всех посетителей — пробуйте смело: проведите интервью, возьмите задачу в работу, отправьте на проверку.</span>
-            <button class="btn btn-sm btn-outline-primary" onclick="resetDemo()"><i class="bi bi-arrow-counterclockwise"></i> Сбросить демо-данные</button>
-        </div>
-        {% endif %}
-        {% block content %}{% endblock %}
+<aside class="sidebar">
+    <div class="brand">
+        <div class="logo"><i class="bi bi-kanban"></i></div>
+        <div><b>CRM аналитика</b><small>Интервью → задачи → KPI</small></div>
     </div>
-    <p class="text-center small" style="color: var(--footer)">CRM системного аналитика v2.0 • данные: crm.db (SQLite)</p>
+    <nav class="side-nav">
+        <div class="sect">Обзор</div>
+        <a class="side-link {% if active_tab == 'dashboard' %}active{% endif %}" href="{{ root }}/"><i class="bi bi-speedometer2"></i> Дашборд</a>
+        <a class="side-link {% if active_tab == 'kanban' %}active{% endif %}" href="{{ root }}/kanban"><i class="bi bi-columns-gap"></i> Канбан-доска</a>
+        <a class="side-link {% if active_tab == 'tasks' %}active{% endif %}" href="{{ root }}/tasks"><i class="bi bi-list-task"></i> Задачи</a>
+        <div class="sect">Аналитика</div>
+        <a class="side-link {% if active_tab == 'interviews' %}active{% endif %}" href="{{ root }}/interviews"><i class="bi bi-chat-quote"></i> Интервью</a>
+        <a class="side-link {% if active_tab == 'bpmn' %}active{% endif %}" href="{{ root }}/bpmn"><i class="bi bi-diagram-3"></i> BPMN-схемы</a>
+        <div class="sect">Команда</div>
+        <a class="side-link {% if active_tab == 'employees' %}active{% endif %}" href="{{ root }}/employees"><i class="bi bi-people"></i> Сотрудники</a>
+        <a class="side-link {% if active_tab == 'kpi' %}active{% endif %}" href="{{ root }}/kpi"><i class="bi bi-graph-up-arrow"></i> KPI и качество</a>
+        <a class="side-link {% if active_tab == 'log' %}active{% endif %}" href="{{ root }}/log"><i class="bi bi-journal-text"></i> Журнал</a>
+    </nav>
+    <div class="side-bottom">
+        {% if root %}<a class="back" href="/"><i class="bi bi-arrow-left"></i> Все проекты</a>{% endif %}
+        <div class="themes" role="group" aria-label="Оформление">
+            <span>Тема</span>
+            <button class="t-classic" data-theme="classic" title="Классика"></button>
+            <button class="t-graphite" data-theme="graphite" title="Графит"></button>
+            <button class="t-bordeaux" data-theme="bordeaux" title="Бордо"></button>
+            <button class="t-violet" data-theme="violet" title="Фиолетовая"></button>
+        </div>
+    </div>
+</aside>
+
+<div class="main">
+    <header class="topbar">
+        <button class="burger" onclick="document.body.classList.toggle('side-open')" aria-label="Меню"><i class="bi bi-list"></i></button>
+        <div>
+            <h2>{% block page_title %}CRM аналитика{% endblock %}</h2>
+            <div class="sub">{% block page_sub %}CRM системного аналитика{% endblock %}</div>
+        </div>
+        <div class="right">
+            {% if demo_mode %}<button class="chip demo" onclick="resetDemo()" title="Вернуть демо-данные к исходным"><i class="bi bi-arrow-counterclockwise"></i> Демо: сбросить</button>{% endif %}
+            <span class="chip date"><i class="bi bi-calendar3"></i> {{ today_str }}</span>
+            <div class="avatar" title="Системный аналитик">СА</div>
+        </div>
+    </header>
+    {% if demo_mode %}
+    <div class="alert alert-info border-0 py-2 small mb-3" style="border-radius: 12px; background: #e8f1ff; color: #1e3a8a;">
+        <i class="bi bi-info-circle"></i> <b>Демо-версия.</b> Данные общие для всех посетителей и сбрасываются раз в сутки — пробуйте смело.
+    </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+    <p class="text-center small text-muted mt-4 mb-0">CRM системного аналитика v3.0 • Flask + SQLite • данные: crm.db</p>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
+    const ROOT = {{ root|tojson }};  // префикс, если CRM открыта не в корне сайта (например, /crm)
+
     function showNotification(message, type = 'info') {
         const notif = document.createElement('div');
         notif.className = `notification ${type}`;
         notif.textContent = message;
         document.body.appendChild(notif);
-        setTimeout(() => {
-            notif.style.animation = 'slideIn 0.3s reverse';
-            setTimeout(() => notif.remove(), 300);
-        }, 4000);
+        setTimeout(() => { notif.style.animation = 'slideIn 0.3s reverse'; setTimeout(() => notif.remove(), 300); }, 4000);
     }
-
-    const ROOT = {{ root|tojson }};  // префикс, если CRM открыта не в корне сайта (например, /crm)
 
     async function api(url, data) {
         let result;
@@ -805,6 +866,12 @@ LAYOUT = """
 
     function reloadSoon() { setTimeout(() => location.reload(), 700); }
 
+    async function resetDemo() {
+        if (!confirm('Вернуть демо-данные к исходному состоянию?')) return;
+        const r = await api('/demo/reset');
+        if (r.success) { showNotification('🔄 Демо-данные восстановлены', 'success'); setTimeout(() => location.href = ROOT + '/', 700); }
+    }
+
     // Тема оформления: сохраняется в браузере, общая с витриной портфолио
     function applyTheme(name) {
         document.documentElement.dataset.theme = name;
@@ -813,12 +880,6 @@ LAYOUT = """
     }
     document.querySelectorAll('.themes button').forEach(b => b.addEventListener('click', () => applyTheme(b.dataset.theme)));
     applyTheme(document.documentElement.dataset.theme || 'classic');
-
-    async function resetDemo() {
-        if (!confirm('Вернуть демо-данные к исходному состоянию?')) return;
-        const r = await api('/demo/reset');
-        if (r.success) { showNotification('🔄 Демо-данные восстановлены', 'success'); setTimeout(() => location.href = ROOT + '/', 700); }
-    }
 
     function fmtDur(sec) {
         const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
@@ -839,13 +900,15 @@ LAYOUT = """
 INDEX = """
 {% extends "layout.html" %}
 {% block title %}Задачи — CRM аналитика{% endblock %}
+{% block page_title %}Задачи{% endblock %}
+{% block page_sub %}Все задачи команды: фильтры, таймер, проверка качества{% endblock %}
 {% block content %}
 <div class="row row-cols-2 row-cols-md-5 g-3 mb-4">
-    <div class="col"><div class="stat-card"><div class="stat-number">{{ stats.total }}</div><div class="stat-label"><i class="bi bi-list-task"></i> Всего задач</div></div></div>
-    <div class="col"><div class="stat-card info"><div class="stat-number">{{ stats.active }}</div><div class="stat-label"><i class="bi bi-play-circle"></i> Новые и в работе</div></div></div>
-    <div class="col"><div class="stat-card warning"><div class="stat-number">{{ stats.review }}</div><div class="stat-label"><i class="bi bi-search"></i> На проверке</div></div></div>
-    <div class="col"><div class="stat-card danger"><div class="stat-number">{{ stats.overdue }}</div><div class="stat-label"><i class="bi bi-exclamation-triangle"></i> Просрочено</div></div></div>
-    <div class="col"><div class="stat-card success"><div class="stat-number">{{ stats.done }}</div><div class="stat-label"><i class="bi bi-check-circle"></i> Выполнено</div></div></div>
+    <div class="col"><div class="stat-card"><div class="stat-icon"><i class="bi bi-list-task"></i></div><div class="stat-label">Всего задач</div><div class="stat-number">{{ stats.total }}</div></div></div>
+    <div class="col"><div class="stat-card info"><div class="stat-icon"><i class="bi bi-play-circle"></i></div><div class="stat-label">Новые и в работе</div><div class="stat-number">{{ stats.active }}</div></div></div>
+    <div class="col"><div class="stat-card warning"><div class="stat-icon"><i class="bi bi-search"></i></div><div class="stat-label">На проверке</div><div class="stat-number">{{ stats.review }}</div></div></div>
+    <div class="col"><div class="stat-card danger"><div class="stat-icon"><i class="bi bi-exclamation-triangle"></i></div><div class="stat-label">Просрочено</div><div class="stat-number">{{ stats.overdue }}</div></div></div>
+    <div class="col"><div class="stat-card success"><div class="stat-icon"><i class="bi bi-check-circle"></i></div><div class="stat-label">Выполнено</div><div class="stat-number">{{ stats.done }}</div></div></div>
 </div>
 
 <div class="d-flex flex-wrap gap-2 mb-3">
@@ -898,7 +961,7 @@ INDEX = """
         <option value="">Все источники</option>
         {% for i in interviews %}<option value="{{ i.id }}" {% if filters.interview == i.id|string %}selected{% endif %}>{{ i.meeting_date|ru_date }} — {{ i.title }}</option>{% endfor %}
     </select></div>
-    <div class="col-12 col-md-1"><a href="{{ root }}/" class="btn btn-sm btn-outline-secondary w-100">Сброс</a></div>
+    <div class="col-12 col-md-1"><a href="{{ root }}/tasks" class="btn btn-sm btn-outline-secondary w-100">Сброс</a></div>
 </form>
 
 <div class="card border-0 shadow-sm"><div class="card-body p-0">
@@ -1047,6 +1110,8 @@ INDEX = """
 INTERVIEWS = """
 {% extends "layout.html" %}
 {% block title %}Интервью — CRM аналитика{% endblock %}
+{% block page_title %}Интервью со стейкхолдерами{% endblock %}
+{% block page_sub %}Протокол встречи (текст или голос) → задачи по отделам → BPMN-схема{% endblock %}
 {% block styles %}
 .voice-panel { background: #fff5f5; border: 1px dashed #f1aeb5; border-radius: 12px; padding: 15px; margin-bottom: 15px; }
 .interim { color: #888; font-style: italic; min-height: 1.5em; }
@@ -1202,7 +1267,7 @@ INTERVIEWS = """
         });
         if (r.success) {
             showNotification(`✅ Интервью сохранено, создано задач: ${r.created}`, 'success');
-            setTimeout(() => location.href = ROOT + '/?interview=' + r.interview_id, 900);
+            setTimeout(() => location.href = ROOT + '/tasks?interview=' + r.interview_id, 900);
         }
     }
 
@@ -1291,13 +1356,17 @@ INTERVIEWS = """
 INTERVIEW_VIEW = """
 {% extends "layout.html" %}
 {% block title %}{{ interview.title }} — CRM аналитика{% endblock %}
+{% block page_title %}Интервью{% endblock %}
+{% block page_sub %}Протокол встречи и созданные по нему задачи{% endblock %}
 {% block content %}
 <a href="{{ root }}/interviews" class="btn btn-sm btn-outline-secondary mb-3"><i class="bi bi-arrow-left"></i> Все интервью</a>
 <h4><i class="bi {{ 'bi-mic-fill text-danger' if interview.source == 'голос' else 'bi-keyboard' }}"></i> {{ interview.title }}</h4>
 <p class="text-muted">Стейкхолдер: {{ interview.stakeholder or 'не указан' }} • Встреча: {{ interview.meeting_date|ru_date }} • Ввод: {{ interview.source }}</p>
 <h6>Протокол</h6>
 <div class="protocol mb-4">{{ interview.text }}</div>
-<h6>Задачи из этого интервью ({{ tasks|length }}) <a href="{{ root }}/?interview={{ interview.id }}" class="small">открыть в списке задач →</a></h6>
+{% if diagram %}<a class="btn btn-sm btn-outline-primary mb-3" href="{{ root }}/bpmn?id={{ diagram.id }}"><i class="bi bi-diagram-3"></i> BPMN-схема процесса</a>
+{% else %}<button class="btn btn-sm btn-outline-primary mb-3" onclick="api('/bpmn/generate', {kind: 'interview', interview_id: {{ interview.id }}}).then(r => r.success && (location.href = ROOT + '/bpmn?id=' + r.id))"><i class="bi bi-diagram-3"></i> Построить BPMN-схему</button>{% endif %}
+<h6>Задачи из этого интервью ({{ tasks|length }}) <a href="{{ root }}/tasks?interview={{ interview.id }}" class="small">открыть в списке задач →</a></h6>
 <ul class="list-group">
     {% for t in tasks %}
     <li class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
@@ -1312,6 +1381,8 @@ INTERVIEW_VIEW = """
 EMPLOYEES = """
 {% extends "layout.html" %}
 {% block title %}Сотрудники — CRM аналитика{% endblock %}
+{% block page_title %}Сотрудники{% endblock %}
+{% block page_sub %}Команда по отделам, отсутствия и загрузка{% endblock %}
 {% block content %}
 <div class="card border-0 shadow-sm mb-4"><div class="card-body">
     <h5 class="card-title"><i class="bi bi-person-plus"></i> Добавить сотрудника</h5>
@@ -1395,17 +1466,19 @@ EMPLOYEES = """
 KPI = """
 {% extends "layout.html" %}
 {% block title %}KPI и качество — CRM аналитика{% endblock %}
+{% block page_title %}KPI и качество{% endblock %}
+{% block page_sub %}Выполнение в срок, качество с первого раза, план/факт по времени{% endblock %}
 {% macro kpi_badge(v) -%}
 {% if v is not none %}<span class="badge kpi-badge text-bg-{{ 'success' if v >= 80 else 'warning' if v >= 60 else 'danger' }}">{{ v }}</span>{% else %}<span class="text-muted">—</span>{% endif %}
 {%- endmacro %}
 {% macro pct(v) -%}{% if v is not none %}{{ v }}%{% else %}<span class="text-muted">—</span>{% endif %}{%- endmacro %}
 {% block content %}
 <div class="row row-cols-2 row-cols-md-5 g-3 mb-4">
-    <div class="col"><div class="stat-card"><div class="stat-number">{{ team.kpi if team and team.kpi is not none else '—' }}</div><div class="stat-label">KPI команды</div></div></div>
-    <div class="col"><div class="stat-card success"><div class="stat-number">{{ team.on_time_pct ~ '%' if team and team.on_time_pct is not none else '—' }}</div><div class="stat-label">Выполнено в срок</div></div></div>
-    <div class="col"><div class="stat-card info"><div class="stat-number">{{ team.quality_pct ~ '%' if team and team.quality_pct is not none else '—' }}</div><div class="stat-label">Принято с 1-го раза</div></div></div>
-    <div class="col"><div class="stat-card danger"><div class="stat-number">{{ returns_total }}</div><div class="stat-label">Возвратов (багов) из {{ checks }} проверок</div></div></div>
-    <div class="col"><div class="stat-card warning"><div class="stat-number" style="font-size: 1.6rem">{{ team.plan if team else 0 }} / {{ team.fact if team else 0 }}</div><div class="stat-label">Часы: план / факт</div></div></div>
+    <div class="col"><div class="stat-card"><div class="stat-icon"><i class="bi bi-graph-up"></i></div><div class="stat-label">KPI команды</div><div class="stat-number">{{ team.kpi if team and team.kpi is not none else '—' }}</div></div></div>
+    <div class="col"><div class="stat-card success"><div class="stat-icon"><i class="bi bi-alarm"></i></div><div class="stat-label">Выполнено в срок</div><div class="stat-number">{{ team.on_time_pct ~ '%' if team and team.on_time_pct is not none else '—' }}</div></div></div>
+    <div class="col"><div class="stat-card info"><div class="stat-icon"><i class="bi bi-patch-check"></i></div><div class="stat-label">Принято с 1-го раза</div><div class="stat-number">{{ team.quality_pct ~ '%' if team and team.quality_pct is not none else '—' }}</div></div></div>
+    <div class="col"><div class="stat-card danger"><div class="stat-icon"><i class="bi bi-bug"></i></div><div class="stat-label">Возвратов (багов) из {{ checks }} проверок</div><div class="stat-number">{{ returns_total }}</div></div></div>
+    <div class="col"><div class="stat-card warning"><div class="stat-icon"><i class="bi bi-hourglass-split"></i></div><div class="stat-label">Часы: план / факт</div><div class="stat-number" style="font-size: 1.6rem">{{ team.plan if team else 0 }} / {{ team.fact if team else 0 }}</div></div></div>
 </div>
 
 <h5><i class="bi bi-person-badge"></i> KPI сотрудников</h5>
@@ -1480,12 +1553,14 @@ KPI = """
 LOG_PAGE = """
 {% extends "layout.html" %}
 {% block title %}Журнал — CRM аналитика{% endblock %}
+{% block page_title %}Журнал событий{% endblock %}
+{% block page_sub %}Логирование: кто, что и когда сделал в системе{% endblock %}
 {% block content %}
 <div class="row row-cols-2 row-cols-md-4 g-3 mb-4">
-    <div class="col"><div class="stat-card"><div class="stat-number">{{ counts.total }}</div><div class="stat-label">Событий за сегодня</div></div></div>
-    <div class="col"><div class="stat-card info"><div class="stat-number">{{ counts.INFO }}</div><div class="stat-label">INFO — действия</div></div></div>
-    <div class="col"><div class="stat-card warning"><div class="stat-number">{{ counts.WARNING }}</div><div class="stat-label">WARNING — отказы и возвраты</div></div></div>
-    <div class="col"><div class="stat-card danger"><div class="stat-number">{{ counts.ERROR }}</div><div class="stat-label">ERROR — сбои</div></div></div>
+    <div class="col"><div class="stat-card"><div class="stat-icon"><i class="bi bi-graph-up"></i></div><div class="stat-label">Событий за сегодня</div><div class="stat-number">{{ counts.total }}</div></div></div>
+    <div class="col"><div class="stat-card info"><div class="stat-icon"><i class="bi bi-patch-check"></i></div><div class="stat-label">INFO — действия</div><div class="stat-number">{{ counts.INFO }}</div></div></div>
+    <div class="col"><div class="stat-card warning"><div class="stat-icon"><i class="bi bi-hourglass-split"></i></div><div class="stat-label">WARNING — отказы и возвраты</div><div class="stat-number">{{ counts.WARNING }}</div></div></div>
+    <div class="col"><div class="stat-card danger"><div class="stat-icon"><i class="bi bi-bug"></i></div><div class="stat-label">ERROR — сбои</div><div class="stat-number">{{ counts.ERROR }}</div></div></div>
 </div>
 
 <form class="row g-2 mb-3" method="get">
@@ -1513,6 +1588,7 @@ LOG_PAGE = """
             {% if e.entity == 'interview' and e.entity_id %}<a href="{{ root }}/interviews/{{ e.entity_id }}">интервью #{{ e.entity_id }}</a>
             {% elif e.entity == 'task' and e.entity_id %}задача #{{ e.entity_id }}
             {% elif e.entity == 'employee' and e.entity_id %}сотрудник #{{ e.entity_id }}
+            {% elif e.entity == 'diagram' and e.entity_id %}<a href="{{ root }}/bpmn?id={{ e.entity_id }}">схема #{{ e.entity_id }}</a>
             {% else %}—{% endif %}
         </td>
     </tr>
@@ -1535,7 +1611,400 @@ LOG_PAGE = """
 {% endblock %}
 """
 
+DASHBOARD = """
+{% extends "layout.html" %}
+{% block title %}Дашборд — CRM аналитика{% endblock %}
+{% block page_title %}Дашборд{% endblock %}
+{% block page_sub %}Сводка по проекту на {{ today_str }}: задачи, сроки, качество, нагрузка команды{% endblock %}
+{% block head %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endblock %}
+{% block styles %}
+.mini-list { list-style: none; padding: 0; margin: 0; }
+.mini-list li { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px dashed var(--line); }
+.mini-list li:last-child { border-bottom: 0; }
+.mini-ic { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; color: #fff; flex: none; }
+.mini-list .val { margin-left: auto; font-weight: 700; }
+.mini-list .pct { width: 48px; text-align: right; color: var(--muted); font-size: .85rem; }
+.chart-box { position: relative; height: 250px; }
+.ev-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; margin-top: 6px; }
+{% endblock %}
+{% block content %}
+<div class="row row-cols-2 row-cols-md-3 row-cols-xl-6 g-3 mb-4">
+    <div class="col"><div class="stat-card"><div class="stat-icon"><i class="bi bi-list-task"></i></div><div class="stat-label">Всего задач</div><div class="stat-number">{{ s.total }}</div><div class="stat-foot">из {{ s.interviews }} интервью</div></div></div>
+    <div class="col"><div class="stat-card sky"><div class="stat-icon"><i class="bi bi-play-circle"></i></div><div class="stat-label">Открытые</div><div class="stat-number">{{ s.active }}</div><div class="stat-foot">новых: {{ s.new }}</div></div></div>
+    <div class="col"><div class="stat-card warning"><div class="stat-icon"><i class="bi bi-search"></i></div><div class="stat-label">На проверке</div><div class="stat-number">{{ s.review }}</div><div class="stat-foot">ждут решения аналитика</div></div></div>
+    <div class="col"><div class="stat-card danger"><div class="stat-icon"><i class="bi bi-alarm"></i></div><div class="stat-label">Просрочено</div><div class="stat-number">{{ s.overdue }}</div><div class="stat-foot">требуют внимания</div></div></div>
+    <div class="col"><div class="stat-card success"><div class="stat-icon"><i class="bi bi-check2-circle"></i></div><div class="stat-label">Выполнено</div><div class="stat-number">{{ s.done }}</div><div class="stat-foot">в срок: {{ s.on_time_pct }}%</div></div></div>
+    <div class="col"><div class="stat-card purple"><div class="stat-icon"><i class="bi bi-trophy"></i></div><div class="stat-label">KPI команды</div><div class="stat-number">{{ s.kpi if s.kpi is not none else '—' }}</div><div class="stat-foot">качество: {{ s.quality_pct }}%</div></div></div>
+</div>
+
+<div class="row g-3">
+    <div class="col-xl-5"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-activity"></i> Динамика <span class="muted">(14 дней)</span></div>
+        <div class="chart-box"><canvas id="trend"></canvas></div>
+    </div></div>
+    <div class="col-xl-4 col-md-6"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-pie-chart"></i> Задачи по отделам</div>
+        <div class="chart-box"><canvas id="depts"></canvas></div>
+    </div></div>
+    <div class="col-xl-3 col-md-6"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-kanban"></i> Статусы <a class="link" href="{{ root }}/kanban">Доска →</a></div>
+        <ul class="mini-list">
+            {% for st in statuses %}
+            <li><span class="mini-ic" style="background: {{ st.bg }}"><i class="bi {{ st.icon }}"></i></span>{{ st.label }}
+                <span class="val">{{ st.n }}</span><span class="pct">{{ st.pct }}%</span></li>
+            {% endfor %}
+        </ul>
+    </div></div>
+</div>
+
+<div class="row g-3 mt-0">
+    <div class="col-xl-5"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-hourglass-split"></i> Ближайшие сроки <a class="link" href="{{ root }}/tasks">Все задачи →</a></div>
+        {% if upcoming %}
+        <div class="table-responsive"><table class="table table-sm align-middle">
+            <thead><tr><th>Задача</th><th>Исполнитель</th><th>Срок</th></tr></thead>
+            <tbody>
+            {% for t in upcoming %}
+            <tr class="task-row {% if t.is_overdue %}overdue{% elif t.status == 'на проверке' %}review{% endif %}">
+                <td><span class="dept dept-{{ t.department|lower }}">{{ t.department }}</span> {{ t.title|truncate(48) }}</td>
+                <td class="text-nowrap small">{{ t.employee_name or '—' }}</td>
+                <td class="text-nowrap small">{{ t.deadline|ru_date }}{% if t.is_overdue %}<br><span class="text-danger">−{{ t.overdue_days }} дн.</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table></div>
+        {% else %}<div class="empty-state"><i class="bi bi-emoji-sunglasses"></i>Открытых задач нет</div>{% endif %}
+    </div></div>
+    <div class="col-xl-4 col-md-6"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-people"></i> Нагрузка сотрудников <span class="muted">(открытые задачи)</span></div>
+        <div class="chart-box"><canvas id="load"></canvas></div>
+    </div></div>
+    <div class="col-xl-3 col-md-6"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-journal-text"></i> Последние события <a class="link" href="{{ root }}/log">Журнал →</a></div>
+        <ul class="mini-list">
+            {% for e in events %}
+            <li style="align-items: flex-start"><span class="ev-dot" style="background: {{ {'INFO': '#2563eb', 'WARNING': '#f59e0b', 'ERROR': '#f43f5e'}[e.level] }}"></span>
+                <div><b class="small">{{ e.action }}</b><div class="small text-muted">{{ e.message|truncate(70) }}</div><div class="small text-muted">{{ e.ts|ru_datetime }}</div></div></li>
+            {% else %}<li class="text-muted small">Событий пока нет</li>{% endfor %}
+        </ul>
+    </div></div>
+</div>
+
+<div class="row g-3 mt-0">
+    <div class="col-xl-7"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-trophy"></i> KPI сотрудников <a class="link" href="{{ root }}/kpi">Подробнее →</a></div>
+        <div class="chart-box"><canvas id="kpi"></canvas></div>
+    </div></div>
+    <div class="col-xl-5"><div class="panel h-100">
+        <div class="panel-title"><i class="bi bi-diagram-3"></i> Процессы и интервью</div>
+        <ul class="mini-list">
+            <li><span class="mini-ic" style="background: var(--g-blue)"><i class="bi bi-chat-quote"></i></span>Интервью проведено<span class="val">{{ s.interviews }}</span></li>
+            <li><span class="mini-ic" style="background: var(--g-teal)"><i class="bi bi-diagram-3"></i></span>BPMN-схем<span class="val">{{ s.diagrams }}</span></li>
+            <li><span class="mini-ic" style="background: var(--g-green)"><i class="bi bi-person-check"></i></span>Сотрудников доступно<span class="val">{{ s.available }} из {{ s.employees }}</span></li>
+            <li><span class="mini-ic" style="background: var(--g-orange)"><i class="bi bi-stopwatch"></i></span>Часы: план / факт (выполненные)<span class="val">{{ s.plan }} / {{ s.fact }}</span></li>
+            <li><span class="mini-ic" style="background: var(--g-pink)"><i class="bi bi-bug"></i></span>Возвратов на доработку<span class="val">{{ s.returns }}</span></li>
+        </ul>
+        <div class="d-flex gap-2 mt-3 flex-wrap">
+            <a class="btn btn-primary btn-sm" href="{{ root }}/interviews"><i class="bi bi-plus-lg"></i> Новое интервью</a>
+            <a class="btn btn-outline-primary btn-sm" href="{{ root }}/bpmn"><i class="bi bi-diagram-3"></i> Схемы процессов</a>
+        </div>
+    </div></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+    const D = {{ charts|tojson }};
+    Chart.defaults.font.family = "'Inter', 'Segoe UI', sans-serif";
+    Chart.defaults.color = '#64748b';
+    const grid = {color: 'rgba(100,116,139,.12)'};
+
+    new Chart(document.getElementById('trend'), {
+        type: 'line',
+        data: {labels: D.days, datasets: [
+            {label: 'Создано', data: D.created, borderColor: '#4f6cff', backgroundColor: 'rgba(79,108,255,.15)', fill: true, tension: .35, pointRadius: 3},
+            {label: 'Выполнено', data: D.completed, borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.10)', fill: true, tension: .35, pointRadius: 3}
+        ]},
+        options: {maintainAspectRatio: false, plugins: {legend: {position: 'top', align: 'end'}},
+                  scales: {y: {beginAtZero: true, ticks: {precision: 0}, grid}, x: {grid: {display: false}}}}
+    });
+    new Chart(document.getElementById('depts'), {
+        type: 'doughnut',
+        data: {labels: D.dept_labels, datasets: [{data: D.dept_values, backgroundColor: ['#0ea5e9', '#8b5cf6', '#f97316', '#f43f5e'], borderWidth: 0, hoverOffset: 8}]},
+        options: {maintainAspectRatio: false, cutout: '62%', plugins: {legend: {position: 'right'}}}
+    });
+    new Chart(document.getElementById('load'), {
+        type: 'bar',
+        data: {labels: D.load_labels, datasets: [{label: 'Открытых задач', data: D.load_values, backgroundColor: ['#4f6cff', '#22c55e', '#f97316', '#a855f7', '#0ea5e9', '#f43f5e', '#14b8a6', '#eab308'], borderRadius: 8}]},
+        options: {indexAxis: 'y', maintainAspectRatio: false, plugins: {legend: {display: false}},
+                  scales: {x: {beginAtZero: true, ticks: {precision: 0}, grid}, y: {grid: {display: false}}}}
+    });
+    new Chart(document.getElementById('kpi'), {
+        type: 'bar',
+        data: {labels: D.kpi_labels, datasets: [{label: 'KPI', data: D.kpi_values,
+            backgroundColor: D.kpi_values.map(v => v >= 80 ? '#22c55e' : v >= 60 ? '#f59e0b' : '#f43f5e'), borderRadius: 8}]},
+        options: {maintainAspectRatio: false, plugins: {legend: {display: false}},
+                  scales: {y: {beginAtZero: true, max: 100, grid}, x: {grid: {display: false}}}}
+    });
+</script>
+{% endblock %}
+"""
+
+KANBAN = """
+{% extends "layout.html" %}
+{% block title %}Канбан — CRM аналитика{% endblock %}
+{% block page_title %}Канбан-доска{% endblock %}
+{% block page_sub %}Перетаскивайте карточки между колонками — статусы и журнал обновятся автоматически{% endblock %}
+{% block styles %}
+.board { display: grid; grid-template-columns: repeat(4, minmax(250px, 1fr)); gap: 16px; overflow-x: auto; padding-bottom: 8px; }
+.col-k { background: #e9eef8; border-radius: 16px; padding: 12px; min-height: 420px; transition: background .2s, box-shadow .2s; }
+.col-k.drag-over { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
+.col-head { display: flex; align-items: center; gap: 8px; font-weight: 700; margin: 2px 4px 12px; }
+.col-head .dot { width: 10px; height: 10px; border-radius: 50%; }
+.col-head .n { margin-left: auto; background: #fff; border-radius: 10px; padding: 1px 9px; font-size: .8rem; color: var(--muted); }
+.kcard { background: #fff; border-radius: 12px; padding: 12px; margin-bottom: 10px; border: 1px solid var(--line); border-left: 4px solid #cbd5e1;
+         box-shadow: 0 2px 8px rgba(15,23,42,.05); cursor: grab; transition: transform .15s, box-shadow .15s; }
+.kcard:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(15,23,42,.10); }
+.kcard.dragging { opacity: .5; cursor: grabbing; }
+.kcard.p-высокий { border-left-color: #f43f5e; } .kcard.p-средний { border-left-color: #f59e0b; } .kcard.p-низкий { border-left-color: #94a3b8; }
+.kcard .t { font-weight: 600; font-size: .9rem; margin: 6px 0; line-height: 1.3; }
+.kcard .meta { display: flex; justify-content: space-between; align-items: center; font-size: .78rem; color: var(--muted); gap: 6px; }
+.kcard .over { color: #e11d48; font-weight: 600; }
+.hint { font-size: .8rem; color: var(--muted); }
+{% endblock %}
+{% block content %}
+<div class="panel py-3">
+    <form class="row g-2 align-items-center" method="get">
+        <div class="col-md-3"><select name="dept" class="form-select form-select-sm" onchange="this.form.submit()">
+            <option value="">Все отделы</option>{% for d in departments %}<option {% if dept == d %}selected{% endif %}>{{ d }}</option>{% endfor %}</select></div>
+        <div class="col-md-3"><select name="emp" class="form-select form-select-sm" onchange="this.form.submit()">
+            <option value="">Все сотрудники</option>{% for e in employees %}<option value="{{ e.id }}" {% if emp == e.id|string %}selected{% endif %}>{{ e.name }}</option>{% endfor %}</select></div>
+        <div class="col-md-6 hint"><i class="bi bi-info-circle"></i> Правила как в жизни: выполненной задача становится только после проверки аналитиком, а возврат с проверки требует описания замечания.</div>
+    </form>
+</div>
+<div class="board">
+    {% for col in columns %}
+    <div class="col-k" data-status="{{ col.status }}">
+        <div class="col-head"><span class="dot" style="background: {{ col.color }}"></span>{{ col.title }}<span class="n">{{ col.tasks|length }}</span></div>
+        {% for t in col.tasks %}
+        <div class="kcard p-{{ t.priority }}" draggable="true" data-id="{{ t.id }}" data-status="{{ t.status }}">
+            <div class="meta"><span class="dept dept-{{ t.department|lower }}">{{ t.department }}</span><span>#{{ t.id }}</span></div>
+            <div class="t">{{ t.title }}</div>
+            <div class="meta">
+                <span><i class="bi bi-person"></i> {{ t.employee_name or 'не назначен' }}</span>
+                <span class="{{ 'over' if t.is_overdue else '' }}"><i class="bi bi-calendar-event"></i> {{ t.deadline|ru_date }}</span>
+            </div>
+            {% if t.returns or t.timer_started_at %}<div class="meta mt-1">
+                {% if t.returns %}<span class="text-danger"><i class="bi bi-bug"></i> возвратов: {{ t.returns }}</span>{% endif %}
+                {% if t.timer_started_at %}<span class="timer running" data-running="1" data-spent="{{ t.spent_live }}">{{ t.spent_live|dur }}</span>{% endif %}
+            </div>{% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+    let dragged = null;
+    document.querySelectorAll('.kcard').forEach(c => {
+        c.addEventListener('dragstart', () => { dragged = c; c.classList.add('dragging'); });
+        c.addEventListener('dragend', () => { c.classList.remove('dragging'); });
+    });
+    document.querySelectorAll('.col-k').forEach(col => {
+        col.addEventListener('dragover', e => { e.preventDefault(); col.classList.add('drag-over'); });
+        col.addEventListener('dragleave', () => col.classList.remove('drag-over'));
+        col.addEventListener('drop', async e => {
+            e.preventDefault();
+            col.classList.remove('drag-over');
+            if (!dragged) return;
+            const id = dragged.dataset.id, from = dragged.dataset.status, to = col.dataset.status;
+            if (from === to) return;
+            if (await move(id, from, to)) reloadSoon();
+        });
+    });
+
+    // Переход между колонками = бизнес-действие в CRM (те же правила, что и в списке задач)
+    async function move(id, from, to) {
+        if (from === 'выполнено') { showNotification('Выполненные задачи не переоткрываются — создайте новую', 'danger'); return false; }
+        if (to === 'в работе' && from === 'новая') return (await api(`/task/${id}/take`)).success;
+        if (to === 'на проверке') return (await api(`/task/${id}/status`, {status: 'на проверке'})).success;
+        if (to === 'выполнено') {
+            if (from !== 'на проверке') { showNotification('Сначала отправьте задачу на проверку', 'danger'); return false; }
+            return (await api(`/task/${id}/review`, {result: 'принято'})).success;
+        }
+        if (to === 'в работе' && from === 'на проверке') {
+            const comment = prompt('Возврат на доработку. Что не так?');
+            if (!comment) return false;
+            return (await api(`/task/${id}/review`, {result: 'возврат', comment})).success;
+        }
+        showNotification('Такой переход не предусмотрен процессом', 'danger');
+        return false;
+    }
+
+    setInterval(() => {
+        document.querySelectorAll('.timer[data-running]').forEach(el => {
+            const s = Number(el.dataset.spent) + 1; el.dataset.spent = s; el.textContent = fmtDur(s);
+        });
+    }, 1000);
+</script>
+{% endblock %}
+"""
+
+BPMN_PAGE = """
+{% extends "layout.html" %}
+{% block title %}BPMN — CRM аналитика{% endblock %}
+{% block page_title %}BPMN-схемы процессов{% endblock %}
+{% block page_sub %}Схема строится автоматически из алгоритма или интервью, дальше её можно править мышкой{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bpmn-js@17.11.1/dist/assets/diagram-js.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bpmn-js@17.11.1/dist/assets/bpmn-js.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bpmn-js@17.11.1/dist/assets/bpmn-font/css/bpmn-embedded.css">
+<script src="https://cdn.jsdelivr.net/npm/bpmn-js@17.11.1/dist/bpmn-modeler.production.min.js"></script>
+{% endblock %}
+{% block styles %}
+#canvas { height: 620px; border: 1px solid var(--line); border-radius: 12px; background: #fff
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Ccircle cx='1' cy='1' r='1' fill='%23e2e8f0'/%3E%3C/svg%3E"); }
+.dlist a { display: block; padding: 9px 12px; border-radius: 10px; text-decoration: none; color: var(--text); margin-bottom: 4px; border: 1px solid transparent; }
+.dlist a:hover { background: #f6f8fc; }
+.dlist a.active { background: var(--accent-soft); border-color: var(--accent); }
+.dlist small { color: var(--muted); display: block; }
+.dsl { font-family: Consolas, monospace; font-size: .82rem; }
+.legend code { background: #f1f5f9; padding: 1px 5px; border-radius: 5px; }
+{% endblock %}
+{% block content %}
+<div class="row g-3">
+    <div class="col-xl-3">
+        <div class="panel">
+            <div class="panel-title"><i class="bi bi-magic"></i> Создать схему</div>
+            <ul class="nav nav-pills nav-fill small mb-3" role="tablist">
+                <li class="nav-item"><button class="nav-link active py-1" data-bs-toggle="pill" data-bs-target="#g-text">Алгоритм</button></li>
+                <li class="nav-item"><button class="nav-link py-1" data-bs-toggle="pill" data-bs-target="#g-int">Интервью</button></li>
+                <li class="nav-item"><button class="nav-link py-1" data-bs-toggle="pill" data-bs-target="#g-tpl">Шаблон</button></li>
+            </ul>
+            <div class="tab-content">
+                <div class="tab-pane fade show active" id="g-text">
+                    <input id="gTitle" class="form-control form-control-sm mb-2" placeholder="Название процесса" value="Обработка заказа">
+                    <textarea id="gText" class="form-control dsl mb-2" rows="11">{{ example }}</textarea>
+                    <button class="btn btn-primary btn-sm w-100" onclick="generate('text')"><i class="bi bi-diagram-3"></i> Построить схему</button>
+                    <details class="small mt-2 legend"><summary>Как писать алгоритм</summary>
+                        <div class="mt-2">Одна строка — один шаг. <code>Роль: действие</code> — дорожка и задача.
+                        <code>Если условие — шаг, иначе шаг</code> — ромб XOR. <code>Параллельно: шаг; шаг</code> — ромб AND.
+                        <code>Ждать …</code> — таймер. <code>Подпроцесс: …</code> — вложенный процесс.
+                        <code>→ вернуться к …</code> — цикл. <code>(конец)</code> — ветка завершается.
+                        <code>Старт: …</code>, <code>Конец: …</code> — события. Роли <code>Система</code>, <code>CRM</code>, <code>1С</code> дают сервисные задачи.</div>
+                    </details>
+                </div>
+                <div class="tab-pane fade" id="g-int">
+                    <select id="gInterview" class="form-select form-select-sm mb-2">
+                        {% for i in interviews %}<option value="{{ i.id }}">{{ i.meeting_date|ru_date }} — {{ i.title }}</option>{% else %}<option value="">Интервью пока нет</option>{% endfor %}
+                    </select>
+                    <p class="small text-muted">Процесс реализации требований: стейкхолдер → аналитик → CRM → отделы параллельно → проверка → приёмка или возврат.</p>
+                    <button class="btn btn-primary btn-sm w-100" onclick="generate('interview')" {% if not interviews %}disabled{% endif %}><i class="bi bi-diagram-3"></i> Построить по интервью</button>
+                </div>
+                <div class="tab-pane fade" id="g-tpl">
+                    <button class="btn btn-outline-primary btn-sm w-100 mb-2" onclick="generate('lifecycle')"><i class="bi bi-arrow-repeat"></i> Жизненный цикл задачи в CRM</button>
+                    <button class="btn btn-outline-secondary btn-sm w-100" onclick="generate('empty')"><i class="bi bi-file-earmark"></i> Пустая схема</button>
+                </div>
+            </div>
+        </div>
+        <div class="panel">
+            <div class="panel-title"><i class="bi bi-folder2-open"></i> Схемы <span class="muted">({{ diagrams|length }})</span></div>
+            <div class="dlist">
+                {% for d in diagrams %}
+                <a href="{{ root }}/bpmn?id={{ d.id }}" class="{{ 'active' if current and d.id == current.id else '' }}">
+                    <b>{{ d.title }}</b><small>{{ d.source }} • {{ d.updated_at|ru_datetime }}</small></a>
+                {% else %}<p class="small text-muted">Схем пока нет — постройте первую.</p>{% endfor %}
+            </div>
+        </div>
+    </div>
+    <div class="col-xl-9">
+        <div class="panel">
+            {% if current %}
+            <div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+                <input id="dTitle" class="form-control form-control-sm" style="max-width: 360px" value="{{ current.title }}">
+                <span class="badge text-bg-light border">{{ current.source }}</span>
+                {% if current.interview_id %}<a class="small" href="{{ root }}/interviews/{{ current.interview_id }}"><i class="bi bi-chat-quote"></i> интервью</a>{% endif %}
+                <div class="ms-auto d-flex gap-2 flex-wrap">
+                    <button class="btn btn-primary btn-sm" onclick="saveDiagram()"><i class="bi bi-save"></i> Сохранить</button>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="exportFile('bpmn')"><i class="bi bi-filetype-xml"></i> .bpmn</button>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="exportFile('svg')"><i class="bi bi-image"></i> SVG</button>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="fit()"><i class="bi bi-arrows-fullscreen"></i></button>
+                    <button class="btn btn-outline-danger btn-sm" onclick="deleteDiagram()"><i class="bi bi-trash"></i></button>
+                </div>
+            </div>
+            <div id="canvas"></div>
+            <p class="small text-muted mt-2 mb-0"><i class="bi bi-mouse"></i> Редактор bpmn-js: перетаскивайте элементы, палитра слева, двойной клик — переименовать.
+                Файл .bpmn открывается в Camunda Modeler, Stormbpmn и других редакторах BPMN 2.0.</p>
+            {% else %}
+            <div class="empty-state"><i class="bi bi-diagram-3"></i><h5>Схема не выбрана</h5><p>Постройте схему слева — из алгоритма, интервью или шаблона.</p></div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+    const CURRENT = {{ (current.id if current else none)|tojson }};
+    let modeler = null;
+
+    async function generate(kind) {
+        const data = {kind};
+        if (kind === 'text') { data.title = document.getElementById('gTitle').value; data.text = document.getElementById('gText').value; }
+        if (kind === 'interview') data.interview_id = document.getElementById('gInterview').value;
+        const r = await api('/bpmn/generate', data);
+        if (r.success) location.href = ROOT + '/bpmn?id=' + r.id;
+    }
+
+    {% if current %}
+    modeler = new BpmnJS({container: '#canvas', keyboard: {bindTo: window}});
+    (async () => {
+        try {
+            await modeler.importXML({{ current.xml|tojson }});
+            fit();
+        } catch (e) {
+            showNotification('Не удалось открыть схему: ' + e.message, 'danger');
+        }
+    })();
+    {% endif %}
+
+    function fit() {
+        if (!modeler) return;
+        const canvas = modeler.get('canvas');
+        canvas.zoom('fit-viewport', 'auto');
+        canvas.zoom(canvas.zoom() * 0.86);           // запас по краям
+        canvas.scroll({dx: 45, dy: 10});              // чтобы начало схемы не пряталось под палитрой
+    }
+
+    async function saveDiagram() {
+        const {xml} = await modeler.saveXML({format: true});
+        const r = await api(`/bpmn/${CURRENT}/save`, {xml, title: document.getElementById('dTitle').value});
+        if (r.success) showNotification('💾 Схема сохранена', 'success');
+    }
+
+    async function exportFile(type) {
+        const title = (document.getElementById('dTitle').value || 'process').replace(/[^\\wа-яё-]+/gi, '_');
+        const res = type === 'svg' ? await modeler.saveSVG() : await modeler.saveXML({format: true});
+        const blob = new Blob([type === 'svg' ? res.svg : res.xml], {type: type === 'svg' ? 'image/svg+xml' : 'application/xml'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${title}.${type}`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }
+
+    async function deleteDiagram() {
+        if (!confirm('Удалить схему?')) return;
+        const r = await api(`/bpmn/${CURRENT}/delete`);
+        if (r.success) location.href = ROOT + '/bpmn';
+    }
+</script>
+{% endblock %}
+"""
+
 app.jinja_env.loader = DictLoader({
+    "dashboard.html": DASHBOARD,
+    "kanban.html": KANBAN,
+    "bpmn.html": BPMN_PAGE,
     "log.html": LOG_PAGE,
     "layout.html": LAYOUT,
     "index.html": INDEX,
@@ -1585,7 +2054,7 @@ def inject_globals():
 
 
 # ==================== МАРШРУТЫ: ЗАДАЧИ ====================
-@app.route("/")
+@app.route("/tasks")
 def index():
     db = get_db()
     tasks = all_tasks(db)
@@ -1841,11 +2310,13 @@ def interviews_save():
             log_event(db, "INFO", "Задача из интервью",
                       f"#{task_id} «{title}» → {dept}, исполнитель: {emp_name(db, emp_id)}, срок {ru_date(deadline)}",
                       "task", task_id)
+        # Схема процесса строится автоматически — аналитику остаётся её проверить и дополнить
+        diagram_id = None if over_demo_limit(db, "diagrams") or not cleaned else interview_diagram(db, interview_id)
         db.commit()
     except ValueError as e:
         db.rollback()
         return fail(str(e))
-    return ok(interview_id=interview_id, created=len(cleaned))
+    return ok(interview_id=interview_id, created=len(cleaned), diagram_id=diagram_id)
 
 
 @app.route("/interviews/<int:interview_id>")
@@ -1855,7 +2326,8 @@ def interview_view(interview_id):
     if not interview:
         abort(404)
     tasks = db.execute(TASKS_SQL + " WHERE t.interview_id = ? ORDER BY t.id", (interview_id,)).fetchall()
-    return render_template("interview_view.html", interview=interview, tasks=tasks, active_tab="interviews")
+    diagram = db.execute("SELECT id FROM diagrams WHERE interview_id = ? ORDER BY id DESC LIMIT 1", (interview_id,)).fetchone()
+    return render_template("interview_view.html", interview=interview, tasks=tasks, diagram=diagram, active_tab="interviews")
 
 
 # ==================== МАРШРУТЫ: СОТРУДНИКИ ====================
@@ -1874,7 +2346,7 @@ DEMO_TEAM = [
 def seed_demo(db):
     """Пример данных для демо: команда, два интервью, задачи во всех статусах, проверки и возвраты."""
     db.executescript(
-        "DELETE FROM reviews; DELETE FROM tasks; DELETE FROM interviews; DELETE FROM employees;"
+        "DELETE FROM reviews; DELETE FROM diagrams; DELETE FROM tasks; DELETE FROM interviews; DELETE FROM employees;"
         " DELETE FROM sqlite_sequence;"
     )
     base, now = today(), datetime.now()
@@ -1969,6 +2441,13 @@ def seed_demo(db):
             log_event(db, "WARNING", "Возврат на доработку", f"#{r['task_id']} «{r['title']}»: {r['comment']}",
                       "task", r["task_id"], ts=r["created_at"])
     log_event(db, "INFO", "Статус сотрудника", "Лебедева Мария: больничный", "employee", None, ts=day(-1, 9))
+    # Готовые BPMN-схемы: по каждому интервью, жизненный цикл задачи и пример алгоритма
+    for i in db.execute("SELECT id FROM interviews ORDER BY id").fetchall():
+        interview_diagram(db, i["id"])
+    save_diagram(db, "Жизненный цикл задачи в CRM", "шаблон",
+                 bpmn_gen.from_text(bpmn_gen.LIFECYCLE_TEXT, "Жизненный цикл задачи в CRM"), bpmn_gen.LIFECYCLE_TEXT)
+    save_diagram(db, "Обработка заказа", "алгоритм",
+                 bpmn_gen.from_text(bpmn_gen.EXAMPLE_TEXT, "Обработка заказа"), bpmn_gen.EXAMPLE_TEXT)
     db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded_on', ?)", (base.isoformat(),))
     db.commit()
 
@@ -2143,6 +2622,231 @@ def log_csv():
         "﻿" + buf.getvalue(), mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=crm_log.csv"},
     )
+
+
+# ==================== МАРШРУТЫ: ДАШБОРД И КАНБАН ====================
+@app.route("/")
+def dashboard():
+    db = get_db()
+    tasks = all_tasks(db)
+    team = kpi_rows(tasks, lambda t: "team")
+    team = team[0] if team else {}
+    done = [t for t in tasks if t["status"] == "выполнено"]
+    emps = db.execute("SELECT * FROM employees ORDER BY name").fetchall()
+    s = dict(
+        total=len(tasks),
+        new=sum(t["status"] == "новая" for t in tasks),
+        active=sum(t["status"] in ("новая", "в работе") for t in tasks),
+        review=sum(t["status"] == "на проверке" for t in tasks),
+        overdue=sum(t["is_overdue"] for t in tasks),
+        done=len(done),
+        kpi=team.get("kpi"),
+        on_time_pct=team.get("on_time_pct") or 0,
+        quality_pct=team.get("quality_pct") or 0,
+        plan=team.get("plan", 0), fact=team.get("fact", 0),
+        returns=sum(t["returns"] for t in tasks),
+        interviews=db.execute("SELECT COUNT(*) FROM interviews").fetchone()[0],
+        diagrams=db.execute("SELECT COUNT(*) FROM diagrams").fetchone()[0],
+        employees=len(emps),
+        available=sum(1 for e in emps if employee_available(e)),
+    )
+    total = max(len(tasks), 1)
+    statuses = [
+        dict(label="Новые", n=s["new"], icon="bi-inbox", bg="var(--g-sky)"),
+        dict(label="В работе", n=s["active"] - s["new"], icon="bi-play-circle", bg="var(--g-blue)"),
+        dict(label="На проверке", n=s["review"], icon="bi-search", bg="var(--g-orange)"),
+        dict(label="Выполнено", n=s["done"], icon="bi-check2-circle", bg="var(--g-green)"),
+        dict(label="Просрочено", n=s["overdue"], icon="bi-alarm", bg="var(--g-pink)"),
+    ]
+    for st in statuses:
+        st["pct"] = round(100 * st["n"] / total)
+
+    # Графики: динамика за 14 дней, отделы, нагрузка, KPI
+    days = [today() - timedelta(days=i) for i in range(13, -1, -1)]
+    created = {d: 0 for d in days}
+    completed = {d: 0 for d in days}
+    for t in tasks:
+        c = datetime.fromisoformat(t["created_at"]).date()
+        if c in created:
+            created[c] += 1
+        if t["completed_at"]:
+            f = datetime.fromisoformat(t["completed_at"]).date()
+            if f in completed:
+                completed[f] += 1
+    load = {}
+    for t in tasks:
+        if t["status"] != "выполнено" and t["employee_name"]:
+            load[t["employee_name"]] = load.get(t["employee_name"], 0) + 1
+    load_sorted = sorted(load.items(), key=lambda kv: -kv[1])[:8]
+    names = {e["id"]: e["name"] for e in emps}
+    kpi_emp = [r for r in kpi_rows([t for t in tasks if t["employee_id"]], lambda t: t["employee_id"]) if r["kpi"] is not None]
+    charts = dict(
+        days=[d.strftime("%d.%m") for d in days],
+        created=[created[d] for d in days], completed=[completed[d] for d in days],
+        dept_labels=DEPARTMENTS, dept_values=[sum(t["department"] == d for t in tasks) for d in DEPARTMENTS],
+        load_labels=[k for k, _ in load_sorted], load_values=[v for _, v in load_sorted],
+        kpi_labels=[names.get(r["key"], "—") for r in kpi_emp], kpi_values=[r["kpi"] for r in kpi_emp],
+    )
+    open_tasks = [t for t in tasks if t["status"] != "выполнено"]
+    upcoming = sorted(open_tasks, key=lambda t: (not t["is_overdue"], t["deadline"]))[:7]
+    events = db.execute("SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT 6").fetchall()
+    return render_template("dashboard.html", s=s, statuses=statuses, charts=charts, upcoming=upcoming,
+                           events=events, active_tab="dashboard")
+
+
+@app.route("/kanban")
+def kanban():
+    db = get_db()
+    dept, emp = request.args.get("dept", ""), request.args.get("emp", "")
+    tasks = all_tasks(db)
+    if dept:
+        tasks = [t for t in tasks if t["department"] == dept]
+    if emp:
+        tasks = [t for t in tasks if str(t["employee_id"]) == emp]
+    prio = {"высокий": 0, "средний": 1, "низкий": 2}
+    tasks.sort(key=lambda t: (not t["is_overdue"], prio.get(t["priority"], 1), t["deadline"]))
+    columns = [
+        dict(status="новая", title="Новые", color="#0ea5e9"),
+        dict(status="в работе", title="В работе", color="#4f6cff"),
+        dict(status="на проверке", title="На проверке", color="#f59e0b"),
+        dict(status="выполнено", title="Выполнено", color="#22c55e"),
+    ]
+    for col in columns:
+        col["tasks"] = [t for t in tasks if t["status"] == col["status"]]
+    columns[3]["tasks"] = sorted(columns[3]["tasks"], key=lambda t: t["completed_at"] or "", reverse=True)[:15]
+    return render_template(
+        "kanban.html", columns=columns, dept=dept, emp=emp, active_tab="kanban",
+        employees=db.execute("SELECT id, name FROM employees ORDER BY name").fetchall(),
+    )
+
+
+@app.route("/task/<int:task_id>/take", methods=["POST"])
+def task_take(task_id):
+    """Канбан: «Новые» -> «В работе» (без запуска таймера)."""
+    db = get_db()
+    t = get_task(db, task_id)
+    if t["status"] != "новая":
+        return fail("Взять в работу можно только новую задачу")
+    if not t["employee_id"]:
+        return fail("Сначала назначьте исполнителя")
+    db.execute("UPDATE tasks SET status = 'в работе' WHERE id = ?", (task_id,))
+    log_event(db, "INFO", "Взята в работу", f"#{task_id} «{t['title']}» ({emp_name(db, t['employee_id'])})",
+              "task", task_id)
+    db.commit()
+    return ok()
+
+
+# ==================== МАРШРУТЫ: BPMN ====================
+def save_diagram(db, title, source, xml, text="", interview_id=None):
+    now = now_iso()
+    diagram_id = db.execute(
+        "INSERT INTO diagrams (title, source, interview_id, text, xml, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (title[:150], source, interview_id, text, xml, now, now),
+    ).lastrowid
+    log_event(db, "INFO", "BPMN-схема построена", f"«{title[:80]}» ({source})", "diagram", diagram_id)
+    return diagram_id
+
+
+def interview_diagram(db, interview_id):
+    """Автоматическая схема процесса реализации требований по интервью."""
+    i = db.execute("SELECT * FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+    if not i:
+        raise ValueError("Интервью не найдено")
+    counts = [(d, db.execute("SELECT COUNT(*) FROM tasks WHERE interview_id = ? AND department = ?", (interview_id, d)).fetchone()[0])
+              for d in DEPARTMENTS]
+    text = bpmn_gen.interview_text(i["title"], i["stakeholder"], counts)
+    title = f"Процесс: {i['title']}"
+    return save_diagram(db, title, "интервью", bpmn_gen.from_text(text, title), text, interview_id)
+
+
+@app.route("/bpmn")
+def bpmn_page():
+    db = get_db()
+    diagrams = db.execute("SELECT id, title, source, updated_at FROM diagrams ORDER BY updated_at DESC, id DESC").fetchall()
+    current = None
+    raw = request.args.get("id", "")
+    if raw.isdigit():
+        current = db.execute("SELECT * FROM diagrams WHERE id = ?", (int(raw),)).fetchone()
+    elif diagrams:
+        current = db.execute("SELECT * FROM diagrams WHERE id = ?", (diagrams[0]["id"],)).fetchone()
+    interviews = db.execute("SELECT id, title, meeting_date FROM interviews ORDER BY id DESC").fetchall()
+    return render_template("bpmn.html", diagrams=diagrams, current=current, interviews=interviews,
+                           example=bpmn_gen.EXAMPLE_TEXT, active_tab="bpmn")
+
+
+@app.route("/bpmn/generate", methods=["POST"])
+def bpmn_generate():
+    d = request.get_json() or {}
+    db = get_db()
+    if over_demo_limit(db, "diagrams"):
+        return fail(DEMO_LIMIT_MESSAGE)
+    kind = d.get("kind")
+    try:
+        if kind == "text":
+            text = (d.get("text") or "").strip()
+            if not text:
+                return fail("Опишите алгоритм по шагам")
+            if len(text) > 5000:
+                return fail("Слишком длинное описание (до 5000 символов)")
+            title = (d.get("title") or "").strip() or "Процесс"
+            diagram_id = save_diagram(db, title, "алгоритм", bpmn_gen.from_text(text, title), text)
+        elif kind == "interview":
+            raw = str(d.get("interview_id") or "")
+            if not raw.isdigit():
+                return fail("Выберите интервью")
+            diagram_id = interview_diagram(db, int(raw))
+        elif kind == "lifecycle":
+            title = "Жизненный цикл задачи в CRM"
+            diagram_id = save_diagram(db, title, "шаблон", bpmn_gen.from_text(bpmn_gen.LIFECYCLE_TEXT, title),
+                                      bpmn_gen.LIFECYCLE_TEXT)
+        elif kind == "empty":
+            text = "Старт: Начало\nПроцесс: Первый шаг\nКонец: Конец"
+            diagram_id = save_diagram(db, "Новая схема", "вручную", bpmn_gen.from_text(text, "Новый процесс"), text)
+        else:
+            return fail("Неизвестный способ построения")
+    except ValueError as e:
+        return fail(str(e))
+    db.commit()
+    return ok(id=diagram_id)
+
+
+@app.route("/bpmn/<int:diagram_id>/save", methods=["POST"])
+def bpmn_save(diagram_id):
+    d = request.get_json() or {}
+    xml = d.get("xml") or ""
+    if "<bpmn:definitions" not in xml and "<definitions" not in xml:
+        return fail("Это не BPMN-схема")
+    if len(xml) > 400_000:
+        return fail("Схема слишком большая")
+    db = get_db()
+    if not db.execute("SELECT 1 FROM diagrams WHERE id = ?", (diagram_id,)).fetchone():
+        abort(404)
+    title = (d.get("title") or "").strip()[:150] or "Схема"
+    db.execute("UPDATE diagrams SET xml = ?, title = ?, updated_at = ? WHERE id = ?", (xml, title, now_iso(), diagram_id))
+    log_event(db, "INFO", "BPMN-схема изменена", f"«{title[:80]}»", "diagram", diagram_id)
+    db.commit()
+    return ok()
+
+
+@app.route("/bpmn/<int:diagram_id>/delete", methods=["POST"])
+def bpmn_delete(diagram_id):
+    db = get_db()
+    row = db.execute("SELECT title FROM diagrams WHERE id = ?", (diagram_id,)).fetchone()
+    if not row:
+        abort(404)
+    db.execute("DELETE FROM diagrams WHERE id = ?", (diagram_id,))
+    log_event(db, "WARNING", "BPMN-схема удалена", f"«{row['title'][:80]}»", "diagram", diagram_id)
+    db.commit()
+    return ok()
+
+
+@app.route("/bpmn/<int:diagram_id>.bpmn")
+def bpmn_download(diagram_id):
+    row = get_db().execute("SELECT xml FROM diagrams WHERE id = ?", (diagram_id,)).fetchone()
+    if not row:
+        abort(404)
+    return Response(row["xml"], mimetype="application/xml",
+                    headers={"Content-Disposition": f"attachment; filename=process_{diagram_id}.bpmn"})
 
 
 # ==================== ЗАПУСК ====================

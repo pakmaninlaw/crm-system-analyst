@@ -39,7 +39,8 @@ def post(url, data=None, expect=True):
 
 
 def test_pages_and_prefix():
-    for page in ["/", "/interviews", "/employees", "/kpi", "/interviews/1", "/?status=просрочено", "/check"]:
+    for page in ["/", "/tasks", "/kanban", "/bpmn", "/interviews", "/employees", "/kpi", "/log", "/interviews/1",
+                 "/tasks?status=просрочено", "/kanban?dept=Backend", "/check"]:
         assert client.get("/crm" + page).status_code == 200, page
     html = client.get("/crm/").get_data(as_text=True)
     assert 'href="/crm/interviews"' in html and 'const ROOT = "/crm"' in html
@@ -130,7 +131,49 @@ def test_error_is_logged():
 
 
 def test_back_to_projects_button():
-    assert 'class="back-home" href="/"' in client.get("/crm/kpi").get_data(as_text=True)
+    assert 'class="back" href="/"' in client.get("/crm/kpi").get_data(as_text=True)
+
+
+def test_dashboard_and_kanban():
+    html = client.get("/crm/").get_data(as_text=True)
+    assert "Динамика" in html and "chart.umd.min.js" in html and "KPI команды" in html
+    db = main.sqlite3.connect(main.DB_FILE)
+    new_id = db.execute("SELECT id FROM tasks WHERE status = 'новая' AND employee_id IS NOT NULL LIMIT 1").fetchone()[0]
+    post(f"/task/{new_id}/take")
+    assert db.execute("SELECT status FROM tasks WHERE id = ?", (new_id,)).fetchone()[0] == "в работе"
+    post(f"/task/{new_id}/take", expect=False)  # повторно нельзя
+    assert "kcard" in client.get("/crm/kanban").get_data(as_text=True)
+
+
+CALC_TEXT = """Старт: Ввод
+Пользователь: Ввести числа
+Если делитель равен нулю — Система: Показать ошибку (конец), иначе Система: Посчитать
+Конец: Результат"""
+
+
+def test_bpmn():
+    import xml.dom.minidom
+    db = main.sqlite3.connect(main.DB_FILE)
+    assert db.execute("SELECT COUNT(*) FROM diagrams").fetchone()[0] >= 4  # демо: 2 интервью + шаблон + пример
+    for kind in ("lifecycle", "empty"):
+        post("/bpmn/generate", {"kind": kind})
+    r = post("/bpmn/generate", {"kind": "text", "title": "Калькулятор",
+                                "text": CALC_TEXT})
+    xml_text = db.execute("SELECT xml FROM diagrams WHERE id = ?", (r["id"],)).fetchone()[0]
+    xml.dom.minidom.parseString(xml_text.encode())
+    assert "exclusiveGateway" in xml_text and "BPMNEdge" in xml_text
+    post("/bpmn/generate", {"kind": "text", "text": ""}, expect=False)
+    iid = db.execute("SELECT id FROM interviews LIMIT 1").fetchone()[0]
+    r2 = post("/bpmn/generate", {"kind": "interview", "interview_id": iid})
+    post(f"/bpmn/{r2['id']}/save", {"xml": xml_text, "title": "Правка"})
+    post(f"/bpmn/{r2['id']}/save", {"xml": "<html/>"}, expect=False)
+    assert client.get(f"/crm/bpmn/{r2['id']}.bpmn").status_code == 200
+    assert "bpmn-modeler" in client.get(f"/crm/bpmn?id={r2['id']}").get_data(as_text=True)
+    post(f"/bpmn/{r2['id']}/delete")
+    # Сохранение интервью автоматически строит схему
+    items = post("/interviews/parse", {"text": main.EXAMPLE_INTERVIEW})["items"]
+    res = post("/interviews/save", {"title": "Авто-схема", "text": main.EXAMPLE_INTERVIEW, "tasks": items})
+    assert res["diagram_id"]
 
 
 def test_demo_limits_and_daily_reset():
